@@ -1,3 +1,6 @@
+; A Bouncy Castle based OpenPGP library for Clojure.
+; https://github.com/MailTube/crypto.openpgp
+; This is free and unencumbered software released into the public domain.
 (ns crypto.openpgp-test
   (:use clojure.test crypto.openpgp)
   (:import [java.util Random]))
