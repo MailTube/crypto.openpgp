@@ -3,11 +3,23 @@
 ; This is free and unencumbered software released into the public domain.
 (ns crypto.openpgp
   (:import
+    [java.util Date]
+    [java.io FilterOutputStream FilterInputStream]
     [java.security SecureRandom]
     [org.apache.commons.math3.distribution BinomialDistribution]
     [org.apache.commons.math3.stat.inference ChiSquareTest]
     [org.apache.commons.math3.util FastMath]
-    [org.bouncycastle.openpgp PGPUtil]))
+    [org.bouncycastle.openpgp
+     PGPLiteralDataGenerator PGPCompressedDataGenerator 
+     PGPEncryptedDataGenerator PGPLiteralData PGPCompressedData 
+     PGPPBEEncryptedData PGPObjectFactory PGPMarker PGPUtil
+     PGPEncryptedDataList]
+    [org.bouncycastle.openpgp.operator.bc 
+     BcPGPDataEncryptorBuilder BcPBEKeyEncryptionMethodGenerator
+     BcPBEDataDecryptorFactory BcPGPDigestCalculatorProvider]
+    [org.bouncycastle.bcpg 
+     CompressionAlgorithmTags SymmetricKeyAlgorithmTags
+     ArmoredOutputStream]))
 
 (defn library-version [] "0.1.0")
 
@@ -55,6 +67,116 @@
         gen (fn [[q _]] (.divideAndRemainder q (biginteger radix)))]
     (shuffle 
       (map mapping (take len (rest (map second (iterate gen [num 0]))))))))
+
+;-------------------------------------------------------------------------------
+
+(defn default-partial [] 1048576)
+
+(definterface ^:private ChainedClose)
+
+(defn- chained-close [stream chained]
+  (proxy [FilterOutputStream ChainedClose] [stream]
+    (close [] 
+      (.close stream) 
+      (when (instance? ChainedClose chained)
+        (.close chained)))))
+
+(defn- skat-from-str [str]
+  (case str
+    "3DES" SymmetricKeyAlgorithmTags/TRIPLE_DES,
+    "CAST5" SymmetricKeyAlgorithmTags/CAST5, 
+    "BLOWFISH" SymmetricKeyAlgorithmTags/BLOWFISH, 
+    "AES" SymmetricKeyAlgorithmTags/AES_128,
+    "AES192" SymmetricKeyAlgorithmTags/AES_192, 
+    "AES256" SymmetricKeyAlgorithmTags/AES_256,
+    "TWOFISH" SymmetricKeyAlgorithmTags/TWOFISH))
+
+(defn- write-armored [os]
+  (let [aos (new ArmoredOutputStream os)]
+    (chained-close aos os)))
+
+(defn- write-pbe-encrypted [os pw & 
+                           {:keys [partial cipher integrity]
+                            :or {partial (default-partial),
+                                 cipher "AES256",
+                                 integrity true}}]
+  (assert (sequential? pw))
+  (let [deb (new BcPGPDataEncryptorBuilder (skat-from-str cipher))]
+    (.setWithIntegrityPacket deb integrity)
+    (let [edg (new PGPEncryptedDataGenerator deb),
+          emg (new BcPBEKeyEncryptionMethodGenerator (char-array pw)),
+          buffer (byte-array partial)]
+      (.addMethod edg emg)
+      (chained-close (.open edg os buffer) os))))
+
+(defn- write-compressed [os &
+                        {:keys [partial]
+                         :or {partial (default-partial)}}]
+  (let [cdg (new PGPCompressedDataGenerator CompressionAlgorithmTags/ZIP),
+        buffer (byte-array partial)]
+    (chained-close (.open cdg os buffer) os)))
+
+(defn- write-literal [os &
+                     {:keys [partial]
+                      :or {partial (default-partial)}}]
+  (let [ldg (new PGPLiteralDataGenerator),
+        date (new Date 0),
+        buffer (byte-array partial)]
+    (chained-close (.open ldg os PGPLiteralData/BINARY "" date buffer) os)))
+
+; Creates a password based encryptor. Returns a java.io.OutputStream object for the caller application to write plaintext into. Parameters: 'output' is a java.io.OutputStream object that will receive ciphertext; 'password' is a sequence of Character's. Optional named parameters: 'enarmor' specifies whether to produce armored textual ciphertext, defaults to false; if 'compress' is false then no compression of plaintext will be done before encryption, default is to compress data; encryption will be performed with a 'cipher' algorithm, defaults to "AES256"; if 'integrity' is false then integrity packet that protects data from modification will not be written, default is to write this packet; 'partial' specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to 1Mb. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close 'output'.
+(defn pbe-encryptor [output password &
+                     {:keys [enarmor compress] 
+                      :or {enarmor false,
+                           compress true} 
+                      :as conf}]
+  (let [forward (flatten (seq conf)),
+        arm (if enarmor (write-armored output) output), 
+        enc (apply (partial write-pbe-encrypted arm password) forward),
+        com (if compress (apply (partial write-compressed enc) forward) enc),
+        lit (apply (partial write-literal com) forward)]
+    lit))
+
+;-------------------------------------------------------------------------------
+
+(defn- dearmor [is]
+  (PGPUtil/getDecoderStream is))
+
+(defn- object-factory [is]
+  (let [of (new PGPObjectFactory is)]
+    (filter #(not (instance? PGPMarker %)) (repeatedly #(.nextObject of)))))
+
+(defn- parse-pbe-encrypted [of pw]
+  (assert (sequential? pw))
+  (let [edl (cast PGPEncryptedDataList (first of)),
+        ed (first (filter 
+                    (partial instance? PGPPBEEncryptedData) 
+                    (iterator-seq (.getEncryptedDataObjects edl))))]
+    (assert ed)
+    (let [ddf (new BcPBEDataDecryptorFactory (char-array pw) 
+                (new BcPGPDigestCalculatorProvider))]
+      [(object-factory (.getDataStream ed ddf)) ed])))
+
+(defn- parse-compressed [of]
+  (let [ld (first of)]
+    (if (not (instance? PGPCompressedData ld))
+      of (object-factory (.getDataStream ld)))))
+
+(defn- parse-literal [of]
+  (let [ld (first (filter #(instance? PGPLiteralData %) of))]
+    (assert ld)
+    (.getInputStream ld)))
+
+; Creates a password based decryptor. Returns a java.io.InputStream object for the caller application to read plaintext from. Parameters: 'input' is a java.io.InputStream object that will be used as a source of ciphertext; 'password' is a sequence of Character's. Closing the returned stream possibly drains all unread data, performs an integrity check and does not close 'input'.
+(defn pbe-decryptor [input password]
+  (let [[of ed] (parse-pbe-encrypted
+                  (object-factory (dearmor input)) password),
+        stream (parse-literal (parse-compressed of))]
+    (proxy [FilterInputStream] [stream]
+      (close []
+        (assert (.verify ed))))))
+
+;-------------------------------------------------------------------------------
 
 (defn -main
   []
