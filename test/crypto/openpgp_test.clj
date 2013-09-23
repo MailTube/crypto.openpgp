@@ -3,7 +3,13 @@
 ; This is free and unencumbered software released into the public domain.
 (ns crypto.openpgp-test
   (:use clojure.test crypto.openpgp)
-  (:import [java.util Random]))
+  (:import 
+    [java.util Random]
+    [java.io 
+     ByteArrayOutputStream ByteArrayInputStream
+     OutputStreamWriter InputStreamReader]))
+
+;-------------------------------------------------------------------------------
 
 (defn- working-random []
   (new java.util.Random 1))
@@ -30,3 +36,31 @@
   (testing "not-random"
     (is (run-nr-test (working-random)))
     (is (not (run-nr-test (broken-random))))))
+
+;-------------------------------------------------------------------------------
+
+(defn- test-string [] 
+  "It doesn’t matter what you create if you have no fun.")
+
+(defn- test-password [] [\p \a \s \s \w \o \r \d])
+
+(defn- pbe-encryptor-test [string password]
+  (let [os (new ByteArrayOutputStream),
+        es (pbe-encryptor os password, :enarmor true),
+        ew (new OutputStreamWriter es "UTF-8")]
+    (spit ew string)
+    (.toByteArray os)))
+
+(defn- pbe-decryptor-test [buffer password]
+  (let [is (new ByteArrayInputStream buffer),
+        ds (pbe-decryptor is password),
+        dr (new InputStreamReader ds "UTF-8")]
+    (slurp dr)))
+
+(deftest c-test
+  (testing "pbe-encryptor/pbe-decryptor"
+    (let [buffer (pbe-encryptor-test (test-string) (test-password)),
+          string (pbe-decryptor-test buffer (test-password))]
+      (is (= string (test-string))))))
+
+;-------------------------------------------------------------------------------
