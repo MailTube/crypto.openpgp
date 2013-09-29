@@ -9,17 +9,27 @@
     [org.apache.commons.math3.distribution BinomialDistribution]
     [org.apache.commons.math3.stat.inference ChiSquareTest]
     [org.apache.commons.math3.util FastMath]
+    [org.bouncycastle.crypto.params 
+     RSAKeyGenerationParameters DSAKeyGenerationParameters 
+     ElGamalKeyGenerationParameters DSAParameterGenerationParameters]
+    [org.bouncycastle.crypto.generators
+     RSAKeyPairGenerator DSAParametersGenerator DSAKeyPairGenerator
+     ElGamalParametersGenerator ElGamalKeyPairGenerator]
+    [org.bouncycastle.crypto.digests SHA256Digest]
     [org.bouncycastle.openpgp
      PGPLiteralDataGenerator PGPCompressedDataGenerator 
      PGPEncryptedDataGenerator PGPLiteralData PGPCompressedData 
      PGPPBEEncryptedData PGPObjectFactory PGPMarker PGPUtil
-     PGPEncryptedDataList]
+     PGPEncryptedDataList PGPKeyRingGenerator PGPSignature 
+     PGPSignatureSubpacketGenerator]
     [org.bouncycastle.openpgp.operator.bc 
      BcPGPDataEncryptorBuilder BcPBEKeyEncryptionMethodGenerator
-     BcPBEDataDecryptorFactory BcPGPDigestCalculatorProvider]
+     BcPBEDataDecryptorFactory BcPGPDigestCalculatorProvider
+     BcPGPKeyPair BcPBESecretKeyEncryptorBuilder BcPGPContentSignerBuilder]
     [org.bouncycastle.bcpg 
      CompressionAlgorithmTags SymmetricKeyAlgorithmTags
-     ArmoredOutputStream]))
+     ArmoredOutputStream PublicKeyAlgorithmTags HashAlgorithmTags]
+    [org.bouncycastle.bcpg.sig KeyFlags Features]))
 
 ;-------------------------------------------------------------------------------
 
@@ -103,7 +113,8 @@
     "AES" SymmetricKeyAlgorithmTags/AES_128,
     "AES192" SymmetricKeyAlgorithmTags/AES_192, 
     "AES256" SymmetricKeyAlgorithmTags/AES_256,
-    "TWOFISH" SymmetricKeyAlgorithmTags/TWOFISH))
+    "TWOFISH" SymmetricKeyAlgorithmTags/TWOFISH,
+    nil SymmetricKeyAlgorithmTags/NULL))
 
 (defn- write-armored [os]
   (let [aos (new ArmoredOutputStream os)]
@@ -189,6 +200,99 @@
     (proxy [FilterInputStream] [stream]
       (close []
         (check (.verify ed))))))
+
+;-------------------------------------------------------------------------------
+
+(defn- prime-certainty [] 80)
+
+(defn- pkat-from-str [str]
+  (case str
+    "RSA-S" PublicKeyAlgorithmTags/RSA_SIGN,
+    "RSA-E" PublicKeyAlgorithmTags/RSA_ENCRYPT,
+    "DSA" PublicKeyAlgorithmTags/DSA,
+    "ELG-E" PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT))
+
+(defn- gen-rsa-kp [random strength]
+  (let [kgp (new RSAKeyGenerationParameters 
+              (biginteger 65537) random strength (prime-certainty)),
+        kpg (new RSAKeyPairGenerator)]
+    (.init kpg kgp) 
+    (.generateKeyPair kpg)))
+
+(defn- gen-dsa-kp [random l-strength]
+  (let [n-strength (if (> l-strength 1024) 256 160),
+        pgp (new DSAParameterGenerationParameters 
+              l-strength n-strength (prime-certainty) random 
+              DSAParameterGenerationParameters/DIGITAL_SIGNATURE_USAGE),
+        pg (new DSAParametersGenerator (new SHA256Digest))]
+    (.init pg pgp)
+    (let [p (.generateParameters pg),
+          kgp (new DSAKeyGenerationParameters random p),
+          kpg (new DSAKeyPairGenerator)]
+      (.init kpg kgp) 
+      (.generateKeyPair kpg))))
+
+(defn- gen-elg-kp [random strength]
+  (let [pg (new ElGamalParametersGenerator)]
+    (.init pg strength (prime-certainty) random)
+    (let [p (.generateParameters pg),
+          kgp (new ElGamalKeyGenerationParameters random p),
+          kpg (new ElGamalKeyPairGenerator)]
+      (.init kpg kgp) 
+      (.generateKeyPair kpg))))
+
+(defn- gen-ssv [date expire flags]
+  (let [ssg (new PGPSignatureSubpacketGenerator)]
+    (.setSignatureCreationTime ssg false date)
+    (when (> expire 0)
+      (.setKeyExpirationTime ssg false expire))
+    (.setKeyFlags ssg false flags)
+    (.setFeature ssg false Features/FEATURE_MODIFICATION_DETECTION)
+    (.generate ssg)))
+
+; Generate a minimal keyring suitable for signing and encryption. The function returns a two-element vector where the first element is a public portion of the generated keyring and the second is a full (secret) keyring. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequence of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.util.Random, defaults to a new java.security.SecureRandom; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'signing' and 'encryption' parameters are two-element vectors each specifying the desired algorithm (the first element) and strength (the second element) of signing and encryption keypairs respectively, defaults are ["DSA" 2048] for signing and ["RSA-E" 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private key PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256"; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration.
+(defn gen-keyring [userid password & 
+           {:keys [random date signing encryption cipher expire] 
+            :or {random (new java.security.SecureRandom),
+                 date (new Date),
+                 signing ["DSA" 2048],
+                 encryption ["RSA-E" 2048],
+                 cipher "AES256",
+                 expire 0}}]
+  (check (sequential? password))
+  (let [skp (condp = (pkat-from-str (first signing)) 
+              PublicKeyAlgorithmTags/DSA
+              (new BcPGPKeyPair PublicKeyAlgorithmTags/DSA 
+                (gen-dsa-kp random (second signing)) date),
+              PublicKeyAlgorithmTags/RSA_SIGN
+              (new BcPGPKeyPair PublicKeyAlgorithmTags/RSA_SIGN 
+                (gen-rsa-kp random (second signing)) date)),
+        skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-str cipher))]
+    (.setSecureRandom skeb random)
+    (let [ske (.build skeb (char-array password)),
+          dc (.get (new BcPGPDigestCalculatorProvider) 
+               HashAlgorithmTags/SHA1),
+          csb (new BcPGPContentSignerBuilder 
+                (.getAlgorithm (.getPublicKey skp)) HashAlgorithmTags/SHA256)]
+      (.setSecureRandom csb random)
+      (let [sss (gen-ssv date expire (bit-or 
+                                       KeyFlags/SIGN_DATA 
+                                       KeyFlags/CERTIFY_OTHER)),
+            krg (new PGPKeyRingGenerator PGPSignature/POSITIVE_CERTIFICATION 
+                  skp userid dc sss nil csb ske)]
+        (when encryption
+          (let [ekp (condp = (pkat-from-str (first encryption)) 
+                      PublicKeyAlgorithmTags/RSA_ENCRYPT
+                      (new BcPGPKeyPair PublicKeyAlgorithmTags/RSA_ENCRYPT 
+                        (gen-rsa-kp random (second encryption)) date),
+                      PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT
+                      (new BcPGPKeyPair PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT 
+                        (gen-elg-kp random (second encryption)) date)),
+                ess (gen-ssv date expire (bit-or 
+                                           KeyFlags/ENCRYPT_COMMS 
+                                           KeyFlags/ENCRYPT_STORAGE))]
+            (.addSubKey krg ekp ess nil)))
+        [(.generatePublicKeyRing krg) (.generateSecretKeyRing krg)]))))
 
 ;-------------------------------------------------------------------------------
 
