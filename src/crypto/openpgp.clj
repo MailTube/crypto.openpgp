@@ -21,15 +21,18 @@
      PGPEncryptedDataGenerator PGPLiteralData PGPCompressedData 
      PGPPBEEncryptedData PGPObjectFactory PGPMarker PGPUtil
      PGPEncryptedDataList PGPKeyRingGenerator PGPSignature 
-     PGPSignatureSubpacketGenerator]
+     PGPSignatureSubpacketGenerator PGPSignatureGenerator
+     PGPSecretKey PGPSecretKeyRing PGPPublicKey PGPPublicKeyRing]
     [org.bouncycastle.openpgp.operator.bc 
      BcPGPDataEncryptorBuilder BcPBEKeyEncryptionMethodGenerator
      BcPBEDataDecryptorFactory BcPGPDigestCalculatorProvider
-     BcPGPKeyPair BcPBESecretKeyEncryptorBuilder BcPGPContentSignerBuilder]
+     BcPGPKeyPair BcPBESecretKeyEncryptorBuilder BcPGPContentSignerBuilder
+     BcPBESecretKeyDecryptorBuilder]
     [org.bouncycastle.bcpg 
      CompressionAlgorithmTags SymmetricKeyAlgorithmTags
      ArmoredOutputStream PublicKeyAlgorithmTags HashAlgorithmTags]
-    [org.bouncycastle.bcpg.sig KeyFlags Features]))
+    [org.bouncycastle.bcpg.sig 
+     KeyFlags Features RevocationReasonTags]))
 
 ;-------------------------------------------------------------------------------
 
@@ -241,24 +244,51 @@
       (.init kpg kgp) 
       (.generateKeyPair kpg))))
 
-(defn- gen-ssv [date expire flags]
+(defn- gen-ssv [date issuer & {:keys [expire flags mdc revocation]}]
   (let [ssg (new PGPSignatureSubpacketGenerator)]
     (.setSignatureCreationTime ssg false date)
-    (when (> expire 0)
-      (.setKeyExpirationTime ssg false expire))
-    (.setKeyFlags ssg false flags)
-    (.setFeature ssg false Features/FEATURE_MODIFICATION_DETECTION)
+    (.setIssuerKeyID ssg false issuer)
+    (when expire (when (> expire 0)
+      (.setKeyExpirationTime ssg false expire)))
+    (when flags 
+      (.setKeyFlags ssg false 
+        (case flags
+          :encrypt (bit-or KeyFlags/ENCRYPT_COMMS KeyFlags/ENCRYPT_STORAGE)
+          :sign (bit-or KeyFlags/SIGN_DATA KeyFlags/CERTIFY_OTHER))))
+    (when mdc
+      (.setFeature ssg false Features/FEATURE_MODIFICATION_DETECTION))
+    (when revocation
+      (.setRevocationReason ssg false RevocationReasonTags/NO_REASON ""))
     (.generate ssg)))
+
+(defn- gen-ssv-std [date issuer expire]
+  (gen-ssv date issuer, :expire expire, :mdc true, :flags :sign))
+
+(defn- key-collide? [key1 key2]
+  (= (.getKeyID key1) (.getKeyID key2)))
+
+(defn- key-pair? [public secret]
+  (and (instance? PGPPublicKey public) (instance? PGPSecretKey secret)
+    (key-collide? public secret)))
+
+(defn- key-signing? [key]
+  (and (instance? PGPSecretKey key) (.isSigningKey key)))
+
+(defn- key-encryption? [key]
+  (and (instance? PGPPublicKey key) (.isEncryptionKey key)))
+
+(defn- key-master? [& keys]
+  (empty? (filter false? (map #(.isMasterKey %) keys))))
 
 ; Generate a minimal keyring suitable for signing and encryption. The function returns a two-element vector where the first element is a public portion of the generated keyring and the second is a full (secret) keyring. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequence of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.util.Random, defaults to a new java.security.SecureRandom; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'signing' and 'encryption' parameters are two-element vectors each specifying the desired algorithm (the first element) and strength (the second element) of signing and encryption keypairs respectively, defaults are ["DSA" 2048] for signing and ["RSA-E" 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private key PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256"; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration.
 (defn gen-keyring [userid password & 
-           {:keys [random date signing encryption cipher expire] 
-            :or {random (new java.security.SecureRandom),
-                 date (new Date),
-                 signing ["DSA" 2048],
-                 encryption ["RSA-E" 2048],
-                 cipher "AES256",
-                 expire 0}}]
+                   {:keys [random date signing encryption cipher expire] 
+                    :or {random (new java.security.SecureRandom),
+                         date (new Date),
+                         signing ["DSA" 2048],
+                         encryption ["RSA-E" 2048],
+                         cipher "AES256",
+                         expire 0}}]
   (check (sequential? password))
   (let [skp (condp = (pkat-from-str (first signing)) 
               PublicKeyAlgorithmTags/DSA
@@ -275,9 +305,7 @@
           csb (new BcPGPContentSignerBuilder 
                 (.getAlgorithm (.getPublicKey skp)) HashAlgorithmTags/SHA256)]
       (.setSecureRandom csb random)
-      (let [sss (gen-ssv date expire (bit-or 
-                                       KeyFlags/SIGN_DATA 
-                                       KeyFlags/CERTIFY_OTHER)),
+      (let [sss (gen-ssv-std date (.getKeyID skp) expire),
             krg (new PGPKeyRingGenerator PGPSignature/POSITIVE_CERTIFICATION 
                   skp userid dc sss nil csb ske)]
         (when encryption
@@ -288,11 +316,67 @@
                       PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT
                       (new BcPGPKeyPair PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT 
                         (gen-elg-kp random (second encryption)) date)),
-                ess (gen-ssv date expire (bit-or 
-                                           KeyFlags/ENCRYPT_COMMS 
-                                           KeyFlags/ENCRYPT_STORAGE))]
+                ess (gen-ssv date (.getKeyID skp), 
+                      :expire expire, :flags :encrypt)]
             (.addSubKey krg ekp ess nil)))
         [(.generatePublicKeyRing krg) (.generateSecretKeyRing krg)]))))
+
+; Adds a new certification to a keyring. A certification binds keys of a keyring to a particular user identifier. A keyring generated by the 'gen-keyring' API already contains a self-signed certificate. Parameters: 'ringpair' is a two-element collection of a public portion of the keyring to be certified and the full (secret) keyring itself; 'userid' is a user String identifier that will be bound to the 'ringpair' keyring by the newly generated certificate; 'signer' is a secret keyring that will be used as a certificate issuer (self-signing is allowed, i.e. 'signer' could be the same object as the second element of the 'ringpair'); 'password' is a sequence of Character's for the purpose of private signing key extraction from the 'signer'. Optional named parameters: 'random' is an object of type java.util.Random, defaults to a new java.security.SecureRandom; 'date' is an object of type java.util.Date representing a certification creation timestamp, defaults to the current time; when self-signing, the certification will obsolete the keyring in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new two-element ringpair collection with the certification added to both public and secret keyring objects.
+(defn keyring-certify [[public secret :as ringpair] userid signer password &
+                       {:keys [random date expire] 
+                        :or {random (new java.security.SecureRandom),
+                             date (new Date),
+                             expire 0}}]
+  (check (sequential? password))
+  (let [pubk (.getPublicKey public),
+        seck (.getSecretKey secret),
+        sigk (.getSecretKey signer),
+        selfsigning (key-collide? sigk seck)]
+    (check (and (key-master? pubk seck sigk) 
+             (key-pair? pubk seck) (key-signing? sigk)))
+    (let [csb (new BcPGPContentSignerBuilder
+                (.getAlgorithm pubk) HashAlgorithmTags/SHA256)]
+      (.setSecureRandom csb random)
+      (let [sg (new PGPSignatureGenerator csb),
+            skdb (new BcPBESecretKeyDecryptorBuilder 
+                   (new BcPGPDigestCalculatorProvider)),
+            ssv (if selfsigning 
+                  (gen-ssv-std date (.getKeyID sigk) expire) 
+                  (gen-ssv date (.getKeyID sigk)))]
+        (.init sg (if selfsigning 
+                    PGPSignature/POSITIVE_CERTIFICATION
+                    PGPSignature/DEFAULT_CERTIFICATION)
+          (.extractPrivateKey sigk (.build skdb (char-array password))))
+        (.setHashedSubpackets sg ssv)
+        (let [sig (.generateCertification sg userid pubk),
+              cpubk (PGPPublicKey/addCertification pubk userid sig),
+              cpublic (PGPPublicKeyRing/insertPublicKey public cpubk)]
+          [cpublic (PGPSecretKeyRing/replacePublicKeys secret cpublic)])))))
+
+; Adds a new self-signed revocation to a keyring. A revoked keyring should no longer be used for signing or encryption. Parameters: 'ringpair' is a two-element collection of a public portion of the keyring to be revoked and the full (secret) keyring itself; 'password' is a sequence of Character's for the purpose of private signing key extraction from the secret part of the 'ringpair'. Optional named parameters: 'random' is an object of type java.util.Random, defaults to a new java.security.SecureRandom; 'date' is an object of type java.util.Date representing a revocation creation timestamp, defaults to the current time. The function returns a new two-element ringpair collection with the revocation added to both public and secret keyring objects.
+(defn keyring-revoke [[public secret :as ringpair] password &
+                      {:keys [random date] 
+                       :or {random (new java.security.SecureRandom),
+                            date (new Date)}}]
+  (check (sequential? password))
+  (let [pubk (.getPublicKey public),
+        seck (.getSecretKey secret)]
+    (check (and (key-master? pubk seck) 
+             (key-pair? pubk seck) (key-signing? seck)))
+    (let [csb (new BcPGPContentSignerBuilder
+                (.getAlgorithm pubk) HashAlgorithmTags/SHA256)]
+      (.setSecureRandom csb random)
+      (let [sg (new PGPSignatureGenerator csb),
+            skdb (new BcPBESecretKeyDecryptorBuilder 
+                   (new BcPGPDigestCalculatorProvider)),
+            ssv (gen-ssv date (.getKeyID pubk), :revocation true)]
+        (.init sg PGPSignature/KEY_REVOCATION
+          (.extractPrivateKey seck (.build skdb (char-array password))))
+        (.setHashedSubpackets sg ssv)
+        (let [sig (.generateCertification sg pubk),
+              cpubk (PGPPublicKey/addCertification pubk sig),
+              cpublic (PGPPublicKeyRing/insertPublicKey public cpubk)]
+          [cpublic (PGPSecretKeyRing/replacePublicKeys secret cpublic)])))))
 
 ;-------------------------------------------------------------------------------
 
