@@ -27,10 +27,11 @@
      BcPGPDataEncryptorBuilder BcPBEKeyEncryptionMethodGenerator
      BcPBEDataDecryptorFactory BcPGPDigestCalculatorProvider
      BcPGPKeyPair BcPBESecretKeyEncryptorBuilder BcPGPContentSignerBuilder
-     BcPBESecretKeyDecryptorBuilder]
+     BcPBESecretKeyDecryptorBuilder BcKeyFingerprintCalculator]
     [org.bouncycastle.bcpg 
      CompressionAlgorithmTags SymmetricKeyAlgorithmTags
-     ArmoredOutputStream PublicKeyAlgorithmTags HashAlgorithmTags]
+     ArmoredOutputStream PublicKeyAlgorithmTags HashAlgorithmTags
+     RSAPublicBCPGKey PublicKeyPacket]
     [org.bouncycastle.bcpg.sig 
      KeyFlags Features RevocationReasonTags]))
 
@@ -152,7 +153,7 @@
         buffer (byte-array partial)]
     (chained-close (.open ldg os PGPLiteralData/BINARY "" date buffer) os)))
 
-; Creates a password based encryptor. Returns a java.io.OutputStream object for the caller application to write plaintext into. Parameters: 'output' is a java.io.OutputStream object that will receive ciphertext; 'password' is a sequence of Character's. Optional named parameters: 'enarmor' specifies whether to produce armored textual ciphertext, defaults to false; if 'compress' is false then no compression of plaintext will be done before encryption, default is to compress data; encryption will be performed with a 'cipher' algorithm, defaults to "AES256"; if 'integrity' is false then integrity packet that protects data from modification will not be written, default is to write this packet; 'partial' specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to 1Mb. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close 'output'.
+; Creates a password based encryptor. Parameters: 'output' is a java.io.OutputStream object that will receive ciphertext; 'password' is a sequential collection of Character's. Optional named parameters: 'enarmor' specifies whether to produce armored textual ciphertext, defaults to false; if 'compress' is false then no compression of plaintext will be done before encryption, default is to compress data; encryption will be performed with a 'cipher' algorithm, defaults to "AES256"; if 'integrity' is false then integrity packet that protects data from modification will not be written, default is to write this packet; 'partial' specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to 1Mb. The function returns a java.io.OutputStream object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close 'output'.
 (defn pbe-encryptor [output password &
                      {:keys [enarmor compress] 
                       :or {enarmor false,
@@ -195,7 +196,7 @@
     (check ld)
     (.getInputStream ld)))
 
-; Creates a password based decryptor. Returns a java.io.InputStream object for the caller application to read plaintext from. Parameters: 'input' is a java.io.InputStream object that will be used as a source of ciphertext; 'password' is a sequence of Character's. Closing the returned stream possibly drains all unread data, performs an integrity check and does not close 'input'.
+; Creates a password based decryptor. Parameters: 'input' is a java.io.InputStream object that will be used as a source of ciphertext; 'password' is a sequential collection of Character's. The function returns a java.io.InputStream object for the caller application to read plaintext from. Closing the returned stream possibly drains all unread data, performs an integrity check and does not close 'input'.
 (defn pbe-decryptor [input password]
   (let [[of ed] (parse-pbe-encrypted
                   (object-factory (dearmor input)) password),
@@ -210,7 +211,7 @@
 (defrecord PublicKeyring [public])
 
 ; SecretKeyring is someone full keyring. Secret keyrings are to be protected in order to be accessible to the keyring owner only; communications of the keyring owner will not be secure otherwise.
-(defrecord SecretKeyring [public secret])
+(defrecord SecretKeyring [secret])
 
 (defn- prime-certainty [] 80)
 
@@ -286,7 +287,18 @@
 (defn- key-master? [& keys]
   (empty? (filter false? (map #(.isMasterKey %) keys))))
 
-; Generates a minimal keyring suitable for signing and encryption. The function returns a keyring in the form of a new SecretKeyring object. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequence of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.util.Random, defaults to a new java.security.SecureRandom; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'signing' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of signing and encryption keypairs respectively, defaults are ["DSA" 2048] for signing and ["RSA-E" 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private key PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256"; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration.
+(defn- keyring-public [keys]
+  (let [stub (new PGPPublicKey ; PGPPublicKeyRing(List) is not accessible.
+               (new PublicKeyPacket PublicKeyAlgorithmTags/RSA_SIGN
+                 (new Date 0) (new RSAPublicBCPGKey 
+                                (biginteger 65537) (biginteger 65537))) 
+               (new BcKeyFingerprintCalculator)),
+        init (new PGPPublicKeyRing (.getEncoded stub) 
+               (new BcKeyFingerprintCalculator)),
+        ring (PGPPublicKeyRing/removePublicKey init (.getPublicKey init))]
+    (reduce #(PGPPublicKeyRing/insertPublicKey %1 %2) ring keys)))
+
+; Generates a minimal keyring suitable for signing and encryption. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequential collection of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'signing' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of signing and encryption keypairs respectively, defaults are ["DSA" 2048] for signing and ["RSA-E" 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private keys PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256"; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new keyring in the form of a SecretKeyring object.
 (defn gen-keyring [userid password & 
                    {:keys [random date signing encryption cipher expire] 
                     :or {random (new java.security.SecureRandom),
@@ -325,17 +337,16 @@
                 ess (gen-ssv date (.getKeyID skp), 
                       :expire expire, :flags :encrypt)]
             (.addSubKey krg ekp ess nil)))
-        (->SecretKeyring 
-          (.generatePublicKeyRing krg) (.generateSecretKeyRing krg))))))
+        (->SecretKeyring (.generateSecretKeyRing krg))))))
 
-; Adds a new certification to a keyring. A certification binds keys of a keyring to a particular user identifier. A keyring generated by the 'gen-keyring' API already contains a self-signed certificate. Parameters: 'keyring' is a SecretKeyring object containing the keyring to be certified; 'userid' is a user String identifier that will be bound to the 'keyring' by the newly generated certificate; 'signer' is a SecretKeyring object that will be used as a certificate issuer (self-signing is allowed, i.e. 'signer' could be the same object as 'keyring'); 'password' is a sequence of Character's for the purpose of private signing key extraction from the 'signer'. Optional named parameters: 'random' is an object of type java.util.Random, defaults to a new java.security.SecureRandom; 'date' is an object of type java.util.Date representing a certification creation timestamp, defaults to the current time; when self-signing, the certification will obsolete the keyring in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new SecretKeyring object with the certification added.
+; Adds a new certification to a keyring. A certification binds keys of a keyring to a particular user identifier. A keyring generated by the 'gen-keyring' API already contains a self-signed certificate. Parameters: 'keyring' is a SecretKeyring object containing the keyring to be certified; 'userid' is a user String identifier that will be bound to the 'keyring' by the newly generated certificate; 'signer' is a SecretKeyring object that will be used as a certificate issuer (self-signing is allowed, i.e. 'signer' could be the same object as 'keyring'); 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'signer'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a certification creation timestamp, defaults to the current time; when self-signing, the certification will obsolete the keyring in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new SecretKeyring object with the certification added.
 (defn keyring-certify [keyring userid signer password &
                        {:keys [random date expire] 
                         :or {random (new java.security.SecureRandom),
                              date (new Date),
                              expire 0}}]
   (check (sequential? password))
-  (let [pubk (.getPublicKey (:public keyring)),
+  (let [pubk (.getPublicKey (:secret keyring)),
         seck (.getSecretKey (:secret keyring)),
         sigk (.getSecretKey (:secret signer)),
         selfsigning (key-collide? sigk seck)]
@@ -357,18 +368,17 @@
         (.setHashedSubpackets sg ssv)
         (let [sig (.generateCertification sg userid pubk),
               cpubk (PGPPublicKey/addCertification pubk userid sig),
-              cpubkr (PGPPublicKeyRing/insertPublicKey 
-                       (:public keyring) cpubk)]
-          (->SecretKeyring cpubkr (PGPSecretKeyRing/replacePublicKeys 
-                                     (:secret keyring) cpubkr)))))))
+              cseck (PGPSecretKey/replacePublicKey seck cpubk)]
+          (->SecretKeyring (PGPSecretKeyRing/insertSecretKey 
+                             (:secret keyring) cseck)))))))
 
-; Adds a new self-signed revocation to a keyring. A revoked keyring should no longer be used for signing or encryption. Parameters: 'keyring' is a SecretKeyring object containing the keyring to be revoked; 'password' is a sequence of Character's for the purpose of private signing key extraction from the 'keyring'. Optional named parameters: 'random' is an object of type java.util.Random, defaults to a new java.security.SecureRandom; 'date' is an object of type java.util.Date representing a revocation creation timestamp, defaults to the current time. The function returns a new SecretKeyring object with the revocation added.
+; Adds a new self-signed revocation to a keyring. A revoked keyring should no longer be used for signing or encryption. Parameters: 'keyring' is a SecretKeyring object containing the keyring to be revoked; 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'keyring'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a revocation creation timestamp, defaults to the current time. The function returns a new SecretKeyring object with the revocation added.
 (defn keyring-revoke [keyring password &
                       {:keys [random date] 
                        :or {random (new java.security.SecureRandom),
                             date (new Date)}}]
   (check (sequential? password))
-  (let [pubk (.getPublicKey (:public keyring)),
+  (let [pubk (.getPublicKey (:secret keyring)),
         seck (.getSecretKey (:secret keyring))]
     (check (and (key-master? pubk seck) 
              (key-pair? pubk seck) (key-signing? seck)))
@@ -384,10 +394,23 @@
         (.setHashedSubpackets sg ssv)
         (let [sig (.generateCertification sg pubk),
               cpubk (PGPPublicKey/addCertification pubk sig),
-              cpubkr (PGPPublicKeyRing/insertPublicKey 
-                       (:public keyring) cpubk)]
-          (->SecretKeyring cpubkr (PGPSecretKeyRing/replacePublicKeys 
-                                    (:secret keyring) cpubkr)))))))
+              cseck (PGPSecretKey/replacePublicKey seck cpubk)]
+          (->SecretKeyring (PGPSecretKeyRing/insertSecretKey 
+                             (:secret keyring) cseck)))))))
+
+; Changes a keyring password that protects private keys of a keyring. Parameters: 'keyring' is a SecretKeyring object containing the keyring which password is going be changed; 'old-password' and 'new-password' are sequential collections of Character's representing old and new passwords respectively. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; the renewed private key PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256". The function returns an updated keyring in the form of a new SecretKeyring object.
+(defn keyring-password [keyring old-password new-password & 
+                        {:keys [random cipher] 
+                         :or {random (new java.security.SecureRandom),
+                              cipher "AES256"}}]
+  (check (sequential? old-password) (sequential? new-password))
+  (let [skdb (new BcPBESecretKeyDecryptorBuilder 
+               (new BcPGPDigestCalculatorProvider)),
+        skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-str cipher))]
+    (.setSecureRandom skeb random)
+    (->SecretKeyring (PGPSecretKeyRing/copyWithNewPassword (:secret keyring) 
+                       (.build skdb (char-array old-password))
+                       (.build skeb (char-array new-password))))))
 
 ;-------------------------------------------------------------------------------
 
