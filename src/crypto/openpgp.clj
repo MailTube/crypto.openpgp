@@ -208,10 +208,16 @@
 ;-------------------------------------------------------------------------------
 
 ; PublicKeyring is a public portion of someone full keyring. Public keyrings are to be published in order to be accessible to anyone the full keyring owner wishes to securely communicate with.
-(defrecord PublicKeyring [public])
+(defrecord ^:private PublicKeyring [public])
 
 ; SecretKeyring is someone full keyring. Secret keyrings are to be protected in order to be accessible to the keyring owner only; communications of the keyring owner will not be secure otherwise.
-(defrecord SecretKeyring [secret])
+(defrecord ^:private SecretKeyring [secret])
+
+(defprotocol ^:private Keyring
+  (^:private keyring-get [keyring])
+  (^:private keyring-get-public [keyring])
+  (^:private keyring-get-public-key [keyring])
+  (^:private keyring-put-public-key [keyring key]))
 
 (defn- prime-certainty [] 80)
 
@@ -221,6 +227,14 @@
     "RSA-E" PublicKeyAlgorithmTags/RSA_ENCRYPT,
     "DSA" PublicKeyAlgorithmTags/DSA,
     "ELG-E" PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT))
+
+(defn- rrt-from-kw [kw]
+  (case kw
+    :key-compromised RevocationReasonTags/KEY_COMPROMISED,
+    :key-retired RevocationReasonTags/KEY_RETIRED,
+    :key-superseded RevocationReasonTags/KEY_SUPERSEDED,
+    :no-reason RevocationReasonTags/NO_REASON,
+    :user-no-longer-valid RevocationReasonTags/USER_NO_LONGER_VALID))
 
 (defn- gen-rsa-kp [random strength]
   (let [kgp (new RSAKeyGenerationParameters 
@@ -251,21 +265,24 @@
       (.init kpg kgp) 
       (.generateKeyPair kpg))))
 
-(defn- gen-ssv [date issuer & {:keys [expire flags mdc revocation]}]
-  (let [ssg (new PGPSignatureSubpacketGenerator)]
-    (.setSignatureCreationTime ssg false date)
-    (.setIssuerKeyID ssg false issuer)
+(defn- gen-ssv [date issuer & {:keys [expire flags mdc revocation revoker]}]
+  (let [cr true, ssg (new PGPSignatureSubpacketGenerator)]
+    (.setRevocable ssg cr false)
+    (.setSignatureCreationTime ssg cr date)
+    (.setIssuerKeyID ssg cr issuer)
     (when expire (when (> expire 0)
-      (.setKeyExpirationTime ssg false expire)))
+      (.setKeyExpirationTime ssg cr expire)))
     (when flags 
-      (.setKeyFlags ssg false 
+      (.setKeyFlags ssg cr 
         (case flags
           :encrypt (bit-or KeyFlags/ENCRYPT_COMMS KeyFlags/ENCRYPT_STORAGE)
           :sign (bit-or KeyFlags/SIGN_DATA KeyFlags/CERTIFY_OTHER))))
     (when mdc
-      (.setFeature ssg false Features/FEATURE_MODIFICATION_DETECTION))
+      (.setFeature ssg cr Features/FEATURE_MODIFICATION_DETECTION))
     (when revocation
-      (.setRevocationReason ssg false RevocationReasonTags/NO_REASON ""))
+      (.setRevocationReason ssg cr (rrt-from-kw revocation) ""))
+    (when revoker
+      (.setRevocationKey ssg cr (first revoker) (second revoker)))
     (.generate ssg)))
 
 (defn- gen-ssv-std [date issuer expire]
@@ -287,16 +304,18 @@
 (defn- key-master? [& keys]
   (empty? (filter false? (map #(.isMasterKey %) keys))))
 
-(defn- keyring-public [keys]
+(defn- keyring-public [secret]
   (let [stub (new PGPPublicKey ; PGPPublicKeyRing(List) is not accessible.
                (new PublicKeyPacket PublicKeyAlgorithmTags/RSA_SIGN
                  (new Date 0) (new RSAPublicBCPGKey 
-                                (biginteger 65537) (biginteger 65537))) 
+                                (biginteger 3) (biginteger 3))) 
                (new BcKeyFingerprintCalculator)),
         init (new PGPPublicKeyRing (.getEncoded stub) 
                (new BcKeyFingerprintCalculator)),
         ring (PGPPublicKeyRing/removePublicKey init (.getPublicKey init))]
-    (reduce #(PGPPublicKeyRing/insertPublicKey %1 %2) ring keys)))
+    (check (empty? (iterator-seq (.getPublicKeys ring))))
+    (let [keys (iterator-seq (.getPublicKeys secret))]
+      (reduce #(PGPPublicKeyRing/insertPublicKey %1 %2) ring keys))))
 
 ; Generates a minimal keyring suitable for signing and encryption. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequential collection of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'signing' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of signing and encryption keypairs respectively, defaults are ["DSA" 2048] for signing and ["RSA-E" 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private keys PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256"; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new keyring in the form of a SecretKeyring object.
 (defn gen-keyring [userid password & 
@@ -337,23 +356,24 @@
                 ess (gen-ssv date (.getKeyID skp), 
                       :expire expire, :flags :encrypt)]
             (.addSubKey krg ekp ess nil)))
-        (->SecretKeyring (.generateSecretKeyRing krg))))))
+        (->SecretKeyring (PGPSecretKeyRing/replacePublicKeys 
+                           (.generateSecretKeyRing krg) 
+                           (.generatePublicKeyRing krg)))))))
 
-; Adds a new certification to a keyring. A certification binds keys of a keyring to a particular user identifier. A keyring generated by the 'gen-keyring' API already contains a self-signed certificate. Parameters: 'keyring' is a SecretKeyring object containing the keyring to be certified; 'userid' is a user String identifier that will be bound to the 'keyring' by the newly generated certificate; 'signer' is a SecretKeyring object that will be used as a certificate issuer (self-signing is allowed, i.e. 'signer' could be the same object as 'keyring'); 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'signer'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a certification creation timestamp, defaults to the current time; when self-signing, the certification will obsolete the keyring in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new SecretKeyring object with the certification added.
+; Adds a new certification to a keyring. A certification binds keys of a keyring to a particular user identifier. A keyring generated by the 'gen-keyring' API already contains a self-signed certificate. Parameters: 'keyring' is a SecretKeyring or PublicKeyring object containing the keyring to be certified; 'userid' is a user String identifier that will be bound to the 'keyring' by the newly generated certificate; 'signer' is a SecretKeyring object that will be used as a certificate issuer (self-signing is allowed, i.e. 'keyring' and 'signer' could belong to the same keyring); 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'signer'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a certification creation timestamp, defaults to the current time; when self-signing, the certification will obsolete the keyring in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a 'keyring' clone with the certification added.
 (defn keyring-certify [keyring userid signer password &
                        {:keys [random date expire] 
                         :or {random (new java.security.SecureRandom),
                              date (new Date),
                              expire 0}}]
   (check (sequential? password))
-  (let [pubk (.getPublicKey (:secret keyring)),
-        seck (.getSecretKey (:secret keyring)),
+  (let [pubk (keyring-get-public-key keyring),
         sigk (.getSecretKey (:secret signer)),
-        selfsigning (key-collide? sigk seck)]
-    (check (and (key-master? pubk seck sigk) 
-             (key-pair? pubk seck) (key-signing? sigk)))
+        selfsigning (key-collide? sigk pubk)]
+    (check (and (key-master? pubk sigk) (key-signing? sigk)))
     (let [csb (new BcPGPContentSignerBuilder
-                (.getAlgorithm pubk) HashAlgorithmTags/SHA256)]
+                (.getAlgorithm (.getPublicKey sigk)) 
+                HashAlgorithmTags/SHA256)]
       (.setSecureRandom csb random)
       (let [sg (new PGPSignatureGenerator csb),
             skdb (new BcPBESecretKeyDecryptorBuilder 
@@ -367,43 +387,65 @@
           (.extractPrivateKey sigk (.build skdb (char-array password))))
         (.setHashedSubpackets sg ssv)
         (let [sig (.generateCertification sg userid pubk),
-              cpubk (PGPPublicKey/addCertification pubk userid sig),
-              cseck (PGPSecretKey/replacePublicKey seck cpubk)]
-          (->SecretKeyring (PGPSecretKeyRing/insertSecretKey 
-                             (:secret keyring) cseck)))))))
+              cpubk (PGPPublicKey/addCertification pubk userid sig)]
+          (keyring-put-public-key keyring cpubk))))))
 
-; Adds a new self-signed revocation to a keyring. A revoked keyring should no longer be used for signing or encryption. Parameters: 'keyring' is a SecretKeyring object containing the keyring to be revoked; 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'keyring'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a revocation creation timestamp, defaults to the current time. The function returns a new SecretKeyring object with the revocation added.
-(defn keyring-revoke [keyring password &
-                      {:keys [random date] 
+; Adds a new revocation certificate to a keyring. A revoked keyring should no longer be used for signing or encryption. Parameters: 'keyring' is a SecretKeyring or PublicKeyring object containing the keyring to be revoked; 'revoker' is a SecretKeyring object that will be used as a revocation issuer (authorized revoke is allowed, i.e. 'keyring' and 'revoker' could belong to different keyrings); 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'revoker'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a revocation creation timestamp, defaults to the current time; 'reason' is a keyword specifying the revocation reason tag to be included in the generated certificate, defaults to nil which means no tagging. The function returns a 'keyring' clone with the revocation added.
+(defn keyring-revoke [keyring revoker password &
+                      {:keys [random date reason] 
                        :or {random (new java.security.SecureRandom),
-                            date (new Date)}}]
+                            date (new Date),
+                            reason nil}}]
+  (check (sequential? password))
+  (let [pubk (keyring-get-public-key keyring),
+        revk (.getSecretKey (:secret revoker))]
+    (check (and (key-master? pubk revk) (key-signing? revk)))
+    (let [csb (new BcPGPContentSignerBuilder
+                (.getAlgorithm (.getPublicKey revk)) 
+                HashAlgorithmTags/SHA256)]
+      (.setSecureRandom csb random)
+      (let [sg (new PGPSignatureGenerator csb),
+            skdb (new BcPBESecretKeyDecryptorBuilder 
+                   (new BcPGPDigestCalculatorProvider)),
+            ssv (gen-ssv date (.getKeyID revk), :revocation reason)]
+        (.init sg PGPSignature/KEY_REVOCATION
+          (.extractPrivateKey revk (.build skdb (char-array password))))
+        (.setHashedSubpackets sg ssv)
+        (let [sig (.generateCertification sg pubk),
+              cpubk (PGPPublicKey/addCertification pubk sig)]
+          (keyring-put-public-key keyring cpubk))))))
+
+; Adds a revoker authorization to a keyring. An authorization is created by a keyring owner in order to allow a revoker to revoke a keyring without being its owner. Parameters: 'keyring' is a SecretKeyring object containing the keyring to add an authorization to; 'revoker' is a SecretKeyring or PublicKeyring object which keyring will be authorized as a valid 'keyring' revocation issuer; 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'keyring'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing an authorization creation timestamp, defaults to the current time; The function returns a 'keyring' clone with the authorization added.
+(defn keyring-add-revoker [keyring password revoker &
+                           {:keys [random date] 
+                            :or {random (new java.security.SecureRandom),
+                                 date (new Date)}}]
   (check (sequential? password))
   (let [pubk (.getPublicKey (:secret keyring)),
-        seck (.getSecretKey (:secret keyring))]
-    (check (and (key-master? pubk seck) 
-             (key-pair? pubk seck) (key-signing? seck)))
+        seck (.getSecretKey (:secret keyring)),
+        revk (keyring-get-public-key revoker)]
+    (check (and (key-master? pubk revk) (key-signing? seck)))
     (let [csb (new BcPGPContentSignerBuilder
                 (.getAlgorithm pubk) HashAlgorithmTags/SHA256)]
       (.setSecureRandom csb random)
       (let [sg (new PGPSignatureGenerator csb),
             skdb (new BcPBESecretKeyDecryptorBuilder 
                    (new BcPGPDigestCalculatorProvider)),
-            ssv (gen-ssv date (.getKeyID pubk), :revocation true)]
-        (.init sg PGPSignature/KEY_REVOCATION
+            ssv (gen-ssv date (.getKeyID pubk), 
+                  :revoker [(.getAlgorithm revk) (.getFingerprint revk)])]
+        (.init sg PGPSignature/DIRECT_KEY
           (.extractPrivateKey seck (.build skdb (char-array password))))
         (.setHashedSubpackets sg ssv)
         (let [sig (.generateCertification sg pubk),
-              cpubk (PGPPublicKey/addCertification pubk sig),
-              cseck (PGPSecretKey/replacePublicKey seck cpubk)]
-          (->SecretKeyring (PGPSecretKeyRing/insertSecretKey 
-                             (:secret keyring) cseck)))))))
+              cpubk (PGPPublicKey/addCertification pubk sig)]
+          (keyring-put-public-key keyring cpubk))))))
 
 ; Changes a keyring password that protects private keys of a keyring. Parameters: 'keyring' is a SecretKeyring object containing the keyring which password is going be changed; 'old-password' and 'new-password' are sequential collections of Character's representing old and new passwords respectively. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; the renewed private key PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256". The function returns an updated keyring in the form of a new SecretKeyring object.
 (defn keyring-password [keyring old-password new-password & 
                         {:keys [random cipher] 
                          :or {random (new java.security.SecureRandom),
                               cipher "AES256"}}]
-  (check (sequential? old-password) (sequential? new-password))
+  (check (and (sequential? old-password) (sequential? new-password)))
   (let [skdb (new BcPBESecretKeyDecryptorBuilder 
                (new BcPGPDigestCalculatorProvider)),
         skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-str cipher))]
@@ -411,6 +453,59 @@
     (->SecretKeyring (PGPSecretKeyRing/copyWithNewPassword (:secret keyring) 
                        (.build skdb (char-array old-password))
                        (.build skeb (char-array new-password))))))
+
+; Extracts public keys from a keyring. Parameter 'keyring' is an object of SecretKeyring or PublicKeyring type. The function returns keys extracted from the 'keyring' in the form of a new PublicKeyring object.
+(defn keyring-publish [keyring]
+  (keyring-get-public keyring))
+
+; Serializes a keyring. Parameters: 'keyring' is a SecretKeyring or PublicKeyring object containing the keys to be serialized; 'output' is a java.io.OutputStream object that will receive encoded data. Optional named parameter 'enarmor' specifies whether to produce armored textual encoding, defaults to false.
+(defn keyring-save [keyring output & 
+                    {:keys [enarmor] 
+                     :or {enarmor false}}]
+  (let [os (if enarmor (new ArmoredOutputStream output) output)]
+    (.encode (keyring-get keyring) os)
+    (when enarmor
+      (.close os))))
+
+; Tests whether a keyring contains a revocation of its master keypair. Parameter 'keyring' is an object of SecretKeyring or PublicKeyring type. The function returns true if the 'keyring' is revoked or false otherwise.
+(defn keyring-revoked? [keyring]
+  (.isRevoked (keyring-get-public-key keyring)))
+
+(extend-protocol Keyring PublicKeyring
+
+  (keyring-get [keyring]
+    (:public keyring))
+  
+  (keyring-get-public [keyring]
+    keyring)
+
+  (keyring-get-public-key [keyring]
+    (.getPublicKey (:public keyring)))
+  
+  (keyring-put-public-key [keyring key]
+    (->PublicKeyring (PGPPublicKeyRing/insertPublicKey 
+                       (:public keyring) key)))
+
+  )
+
+(extend-protocol Keyring SecretKeyring
+  
+  (keyring-get [keyring]
+    (:secret keyring))
+
+  (keyring-get-public [keyring]
+    (->PublicKeyring (keyring-public (:secret keyring))))
+
+  (keyring-get-public-key [keyring]
+    (.getPublicKey (:secret keyring)))
+  
+  (keyring-put-public-key [keyring key]
+    (let [sk (.getSecretKey (:secret keyring)),
+          usk (PGPSecretKey/replacePublicKey sk key)]
+      (->SecretKeyring (PGPSecretKeyRing/insertSecretKey 
+                         (:secret keyring) usk))))
+    
+  )
 
 ;-------------------------------------------------------------------------------
 
