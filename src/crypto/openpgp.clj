@@ -109,15 +109,15 @@
       (when (instance? ChainedClose chained)
         (.close chained)))))
 
-(defn- skat-from-str [str]
-  (case str
-    "3DES" SymmetricKeyAlgorithmTags/TRIPLE_DES,
-    "CAST5" SymmetricKeyAlgorithmTags/CAST5, 
-    "BLOWFISH" SymmetricKeyAlgorithmTags/BLOWFISH, 
-    "AES" SymmetricKeyAlgorithmTags/AES_128,
-    "AES192" SymmetricKeyAlgorithmTags/AES_192, 
-    "AES256" SymmetricKeyAlgorithmTags/AES_256,
-    "TWOFISH" SymmetricKeyAlgorithmTags/TWOFISH,
+(defn- skat-from-kw [kw]
+  (case kw
+    :TRIPLE-DES SymmetricKeyAlgorithmTags/TRIPLE_DES,
+    :CAST5 SymmetricKeyAlgorithmTags/CAST5, 
+    :BLOWFISH SymmetricKeyAlgorithmTags/BLOWFISH, 
+    :AES-128 SymmetricKeyAlgorithmTags/AES_128,
+    :AES-192 SymmetricKeyAlgorithmTags/AES_192, 
+    :AES-256 SymmetricKeyAlgorithmTags/AES_256,
+    :TWOFISH SymmetricKeyAlgorithmTags/TWOFISH,
     nil SymmetricKeyAlgorithmTags/NULL))
 
 (defn- write-armored [os]
@@ -127,10 +127,10 @@
 (defn- write-pbe-encrypted [os pw & 
                            {:keys [partial cipher integrity]
                             :or {partial (default-partial),
-                                 cipher "AES256",
+                                 cipher :AES-256,
                                  integrity true}}]
   (check (sequential? pw))
-  (let [deb (new BcPGPDataEncryptorBuilder (skat-from-str cipher))]
+  (let [deb (new BcPGPDataEncryptorBuilder (skat-from-kw cipher))]
     (.setWithIntegrityPacket deb integrity)
     (let [edg (new PGPEncryptedDataGenerator deb),
           emg (new BcPBEKeyEncryptionMethodGenerator (char-array pw)),
@@ -153,7 +153,7 @@
         buffer (byte-array partial)]
     (chained-close (.open ldg os PGPLiteralData/BINARY "" date buffer) os)))
 
-; Creates a password based encryptor. Parameters: 'output' is a java.io.OutputStream object that will receive ciphertext; 'password' is a sequential collection of Character's. Optional named parameters: 'enarmor' specifies whether to produce armored textual ciphertext, defaults to false; if 'compress' is false then no compression of plaintext will be done before encryption, default is to compress data; encryption will be performed with a 'cipher' algorithm, defaults to "AES256"; if 'integrity' is false then integrity packet that protects data from modification will not be written, default is to write this packet; 'partial' specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to 1Mb. The function returns a java.io.OutputStream object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close 'output'.
+; Creates a password based encryptor. Parameters: 'output' is a java.io.OutputStream object that will receive ciphertext; 'password' is a sequential collection of Character's. Optional named parameters: 'enarmor' specifies whether to produce armored textual ciphertext, defaults to false; if 'compress' is false then no compression of plaintext will be done before encryption, default is to compress data; encryption will be performed with a 'cipher' algorithm, defaults to :AES-256; if 'integrity' is false then integrity packet that protects data from modification will not be written, default is to write this packet; 'partial' specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to 1Mb. The function returns a java.io.OutputStream object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close 'output'.
 (defn pbe-encryptor [output password &
                      {:keys [enarmor compress] 
                       :or {enarmor false,
@@ -221,20 +221,13 @@
 
 (defn- prime-certainty [] 80)
 
-(defn- pkat-from-str [str]
-  (case str
-    "RSA-S" PublicKeyAlgorithmTags/RSA_SIGN,
-    "RSA-E" PublicKeyAlgorithmTags/RSA_ENCRYPT,
-    "DSA" PublicKeyAlgorithmTags/DSA,
-    "ELG-E" PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT))
-
 (defn- rrt-from-kw [kw]
   (case kw
-    :key-compromised RevocationReasonTags/KEY_COMPROMISED,
-    :key-retired RevocationReasonTags/KEY_RETIRED,
-    :key-superseded RevocationReasonTags/KEY_SUPERSEDED,
-    :no-reason RevocationReasonTags/NO_REASON,
-    :user-no-longer-valid RevocationReasonTags/USER_NO_LONGER_VALID))
+    :KEY-COMPROMISED RevocationReasonTags/KEY_COMPROMISED,
+    :KEY-RETIRED RevocationReasonTags/KEY_RETIRED,
+    :KEY-SUPERSEDED RevocationReasonTags/KEY_SUPERSEDED,
+    :NO-REASON RevocationReasonTags/NO_REASON,
+    :USER-NO-LONGER-VALID RevocationReasonTags/USER_NO_LONGER_VALID))
 
 (defn- gen-rsa-kp [random strength]
   (let [kgp (new RSAKeyGenerationParameters 
@@ -317,24 +310,26 @@
     (let [keys (iterator-seq (.getPublicKeys secret))]
       (reduce #(PGPPublicKeyRing/insertPublicKey %1 %2) ring keys))))
 
-; Generates a minimal keyring suitable for signing and encryption. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequential collection of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'signing' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of signing and encryption keypairs respectively, defaults are ["DSA" 2048] for signing and ["RSA-E" 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private keys PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256"; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new keyring in the form of a SecretKeyring object.
+; Generates a minimal keyring suitable for signing and encryption. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequential collection of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'master' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of master and encryption keypairs respectively, defaults are [:DSA 2048] for master and [:RSA-ENCRYPT 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private keys PBE protection will be performed with a 'cipher' algorithm, defaults to :AES-256; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new keyring in the form of a SecretKeyring object.
 (defn gen-keyring [userid password & 
-                   {:keys [random date signing encryption cipher expire] 
+                   {:keys [random date master encryption cipher expire] 
                     :or {random (new java.security.SecureRandom),
                          date (new Date),
-                         signing ["DSA" 2048],
-                         encryption ["RSA-E" 2048],
-                         cipher "AES256",
+                         master [:DSA 2048],
+                         encryption [:RSA-ENCRYPT 2048],
+                         cipher :AES-256,
                          expire 0}}]
   (check (sequential? password))
-  (let [skp (condp = (pkat-from-str (first signing)) 
-              PublicKeyAlgorithmTags/DSA
+  (let [skp (case (first master) 
+              :DSA 
               (new BcPGPKeyPair PublicKeyAlgorithmTags/DSA 
-                (gen-dsa-kp random (second signing)) date),
-              PublicKeyAlgorithmTags/RSA_SIGN
+                (gen-dsa-kp random (second master)) date),
+              :RSA-SIGN 
               (new BcPGPKeyPair PublicKeyAlgorithmTags/RSA_SIGN 
-                (gen-rsa-kp random (second signing)) date)),
-        skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-str cipher))]
+                (gen-rsa-kp random (second master)) date)),
+        skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-kw cipher) 
+               (.get (new BcPGPDigestCalculatorProvider) 
+                 HashAlgorithmTags/SHA256))]
     (.setSecureRandom skeb random)
     (let [ske (.build skeb (char-array password)),
           dc (.get (new BcPGPDigestCalculatorProvider) 
@@ -346,11 +341,11 @@
             krg (new PGPKeyRingGenerator PGPSignature/POSITIVE_CERTIFICATION 
                   skp userid dc sss nil csb ske)]
         (when encryption
-          (let [ekp (condp = (pkat-from-str (first encryption)) 
-                      PublicKeyAlgorithmTags/RSA_ENCRYPT
+          (let [ekp (case (first encryption) 
+                      :RSA-ENCRYPT
                       (new BcPGPKeyPair PublicKeyAlgorithmTags/RSA_ENCRYPT 
                         (gen-rsa-kp random (second encryption)) date),
-                      PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT
+                      :ELGAMAL-ENCRYPT
                       (new BcPGPKeyPair PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT 
                         (gen-elg-kp random (second encryption)) date)),
                 ess (gen-ssv date (.getKeyID skp), 
@@ -440,19 +435,34 @@
               cpubk (PGPPublicKey/addCertification pubk sig)]
           (keyring-put-public-key keyring cpubk))))))
 
-; Changes a keyring password that protects private keys of a keyring. Parameters: 'keyring' is a SecretKeyring object containing the keyring which password is going be changed; 'old-password' and 'new-password' are sequential collections of Character's representing old and new passwords respectively. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; the renewed private key PBE protection will be performed with a 'cipher' algorithm, defaults to "AES256". The function returns an updated keyring in the form of a new SecretKeyring object.
+; Changes keyring passwords that protect private keys of a keyring. Parameters: 'keyring' is a SecretKeyring object containing the keyring which passwords are going be changed; 'old-password' and 'new-password' are sequential collections of Character's representing old and new passwords respectively. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; the renewed private keys PBE protection will be performed with a 'cipher' algorithm, defaults to :AES-256; 'scope' is a keyword that specifies what secret keys to update, defaults to :all. The function returns an updated keyring in the form of a new SecretKeyring object. Possible values for 'scope': :all, :master, :subkeys.   
 (defn keyring-password [keyring old-password new-password & 
-                        {:keys [random cipher] 
+                        {:keys [random cipher scope] 
                          :or {random (new java.security.SecureRandom),
-                              cipher "AES256"}}]
+                              cipher :AES-256,
+                              scope :all}}]
   (check (and (sequential? old-password) (sequential? new-password)))
-  (let [skdb (new BcPBESecretKeyDecryptorBuilder 
+  (let [bckr (:secret keyring),
+        mk (.getSecretKey bckr),
+        skdb (new BcPBESecretKeyDecryptorBuilder 
                (new BcPGPDigestCalculatorProvider)),
-        skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-str cipher))]
+        skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-kw cipher)
+               (.get (new BcPGPDigestCalculatorProvider) 
+                 HashAlgorithmTags/SHA256))]
+    (check (key-master? mk))
     (.setSecureRandom skeb random)
-    (->SecretKeyring (PGPSecretKeyRing/copyWithNewPassword (:secret keyring) 
-                       (.build skdb (char-array old-password))
-                       (.build skeb (char-array new-password))))))
+    (let [skd (.build skdb (char-array old-password)),
+          ske (.build skeb (char-array new-password))]
+      (case scope
+        :all
+        (->SecretKeyring (PGPSecretKeyRing/copyWithNewPassword bckr skd ske)),
+        :master
+        (let [umk (PGPSecretKey/copyWithNewPassword mk skd ske)]
+          (->SecretKeyring (PGPSecretKeyRing/insertSecretKey bckr umk))),
+        :subkeys
+        (let [tkr (PGPSecretKeyRing/removeSecretKey bckr mk),
+              ukr (PGPSecretKeyRing/copyWithNewPassword tkr skd ske)]
+          (->SecretKeyring (PGPSecretKeyRing/insertSecretKey ukr mk)))))))
 
 ; Extracts public keys from a keyring. Parameter 'keyring' is an object of SecretKeyring or PublicKeyring type. The function returns keys extracted from the 'keyring' in the form of a new PublicKeyring object.
 (defn keyring-publish [keyring]
