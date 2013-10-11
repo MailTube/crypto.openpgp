@@ -216,7 +216,6 @@
 (defprotocol ^:private Keyring
   (^:private keyring-get [keyring])
   (^:private keyring-get-public [keyring])
-  (^:private keyring-get-public-key [keyring])
   (^:private keyring-put-public-key [keyring key]))
 
 (defn- prime-certainty [] 80)
@@ -281,7 +280,7 @@
       (gen-elg-kp random strength) date)))
 
 (defn- gen-ssv [date issuer & {:keys [expire flags mdc revocation revoker 
-                                      embedded]}]
+                                      embedded prefs]}]
   (let [cr true, ssg (new PGPSignatureSubpacketGenerator)]
     (.setRevocable ssg cr false)
     (.setSignatureCreationTime ssg cr date)
@@ -302,10 +301,16 @@
       (.setRevocationKey ssg cr (first revoker) (second revoker)))
     (when embedded
       (.setEmbeddedSignature ssg cr embedded))
+    (when prefs
+      (.setPreferredSymmetricAlgorithms ssg cr 
+        (int-array [SymmetricKeyAlgorithmTags/AES_256]))
+      (.setPreferredHashAlgorithms ssg cr 
+        (int-array [HashAlgorithmTags/SHA256])))
     (.generate ssg)))
 
 (defn- gen-ssv-std [date issuer expire]
-  (gen-ssv date issuer, :expire expire, :mdc true, :flags :sign-certify))
+  (gen-ssv date issuer, :expire expire, :mdc true, 
+    :flags :sign-certify, :prefs true))
 
 (defn- key-collide? [key1 key2]
   (= (.getKeyID key1) (.getKeyID key2)))
@@ -335,6 +340,13 @@
     (check (empty? (iterator-seq (.getPublicKeys ring))))
     (let [keys (iterator-seq (.getPublicKeys secret))]
       (reduce #(PGPPublicKeyRing/insertPublicKey %1 %2) ring keys))))
+
+(defn- keyring-get-public-key 
+  ([keyring]
+    (.getPublicKey (keyring-get keyring)))
+  ([keyring keyid]
+    (if keyid (.getPublicKey (keyring-get keyring) keyid)
+      (keyring-get-public-key keyring))))
 
 ; Generates a minimal keyring suitable for signing and encryption. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequential collection of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'master' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of master and encryption keypairs respectively, defaults are [:DSA 2048] for master and [:RSA-ENCRYPT 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private keys PBE protection will be performed with a 'cipher' algorithm, defaults to :AES-256; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration; 'level' is a keyword defining a type of a self-signed certification that will be included in the keyring, defaults to :POSITIVE-CERTIFICATION. The function returns a new keyring in the form of a SecretKeyring object.
 (defn gen-keyring [userid password & 
@@ -400,22 +412,22 @@
               cpubk (PGPPublicKey/addCertification pubk userid sig)]
           (keyring-put-public-key keyring cpubk))))))
 
-; Generates a new keypair suitable for signing or encryption and adds it to a keyring. Parameters: 'keyring' is a SecretKeyring object containing the keyring to add a keypair to; 'password' is a sequential collection of Character's for the purpose of private master key extraction from the 'keyring'; 'usage' is a keyword selecting whether to generate a signing or an encryption keypair. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keypair creation timestamp, defaults to the current time; 'subkeypair' parameter is a two-element collection specifying the desired algorithm (the first element) and strength (the second element) of a keypair, defaults are [:RSA-SIGN 2048] for signing and [:RSA-ENCRYPT 2048] for encryption; 'subpassword' is a sequential collection of Character's for the keypair private key PBE protection, defaults to 'password'; the keypair private key PBE protection will be performed with a 'cipher' algorithm, defaults to :AES-256; the keypair will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a 'keyring' clone with a newly generated keypair added. Possible values for 'usage': :sign, :encrypt.
-(defn keyring-add-subkeypair [keyring password usage & 
-                              {:keys [random date subkeypair 
-                                      subpassword cipher expire] 
-                               :or {random (new java.security.SecureRandom),
-                                    date (new Date),
-                                    subkeypair (case usage 
-                                                 :sign [:RSA-SIGN 2048],
-                                                 :encrypt [:RSA-ENCRYPT 2048])
-                                    subpassword password, 
-                                    cipher :AES-256,
-                                    expire 0}}]
+; Generates a new keypair suitable for signing or encryption and adds it to a keyring. Parameters: 'keyring' is a SecretKeyring object containing the keyring to add a keypair to; 'password' is a sequential collection of Character's for the purpose of private master signing key extraction from the 'keyring'; 'usage' is a keyword selecting whether to generate a signing or an encryption keypair. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keypair creation timestamp, defaults to the current time; 'spec' parameter is a two-element collection specifying the desired algorithm (the first element) and strength (the second element) of a keypair, defaults are [:RSA-SIGN 2048] for signing and [:RSA-ENCRYPT 2048] for encryption; 'subpassword' is a sequential collection of Character's for the keypair private key PBE protection, defaults to 'password'; the keypair private key PBE protection will be performed with a 'cipher' algorithm, defaults to :AES-256; the keypair will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a 'keyring' clone with a newly generated keypair added. Possible values for 'usage': :sign, :encrypt.
+(defn keyring-gen-keypair [keyring password usage & 
+                           {:keys [random date spec 
+                                   subpassword cipher expire] 
+                            :or {random (new java.security.SecureRandom),
+                                 date (new Date),
+                                 spec (case usage 
+                                        :sign [:RSA-SIGN 2048],
+                                        :encrypt [:RSA-ENCRYPT 2048]),
+                                 subpassword password, 
+                                 cipher :AES-256,
+                                 expire 0}}]
   (check (and (sequential? password) (sequential? subpassword)))
   (let [mpubk (.getPublicKey (:secret keyring)), 
         mseck (.getSecretKey (:secret keyring)),
-        kp (gen-keypair (first subkeypair) random (second subkeypair) date),
+        kp (gen-keypair (first spec) random (second spec) date),
         skdb (new BcPBESecretKeyDecryptorBuilder 
                (new BcPGPDigestCalculatorProvider)),
         skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-kw cipher) 
@@ -452,16 +464,17 @@
           (->SecretKeyring 
             (PGPSecretKeyRing/insertSecretKey (:secret keyring) key)))))))
 
-; Adds a new revocation certificate to a keyring. A revoked keyring should no longer be used for signing or encryption. Parameters: 'keyring' is a SecretKeyring or PublicKeyring object containing the keyring to be revoked; 'revoker' is a SecretKeyring object that will be used as a revocation issuer (authorized revoke is allowed, i.e. 'keyring' and 'revoker' could belong to different keyrings); 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'revoker'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a revocation creation timestamp, defaults to the current time; 'reason' is a keyword specifying the revocation reason tag to be included in the generated certificate, defaults to nil which means no tagging. The function returns a 'keyring' clone with the revocation added.
+; Adds a new revocation certificate to a keypair. A revoked keypair (or the whole keyring in the case of a master keypair) should no longer be used for signing or encryption. Parameters: 'keyring' is a SecretKeyring or PublicKeyring object containing the keypair to be revoked; 'revoker' is a SecretKeyring object that will be used as a revocation issuer (authorized revoke is allowed, i.e. 'keyring' and 'revoker' could belong to different keyrings); 'password' is a sequential collection of Character's for the purpose of private master signing key extraction from the 'revoker'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a revocation creation timestamp, defaults to the current time; 'reason' is a keyword specifying the revocation reason tag to be included in the generated certificate, defaults to nil which means no tagging; 'keyid' is a 64-bit integer identifying the keypair to be revoked, defaults to nil which selects the master keypair. The function returns a 'keyring' clone with the revocation added. (FIXME: subkey revocations generated by this function are currently not compatible with GnuPG.)
 (defn keyring-revoke [keyring revoker password &
-                      {:keys [random date reason] 
+                      {:keys [random date reason keyid] 
                        :or {random (new java.security.SecureRandom),
                             date (new Date),
-                            reason nil}}]
+                            reason nil, keyid nil}}]
   (check (sequential? password))
-  (let [pubk (keyring-get-public-key keyring),
+  (let [pubk (keyring-get-public-key keyring keyid),
         revk (.getSecretKey (:secret revoker))]
-    (check (and (key-master? pubk revk) (key-signing? revk)))
+    (check (and (key-master? revk) (key-signing? revk)))
+    (when-not keyid (check (key-master? pubk)))
     (let [csb (new BcPGPContentSignerBuilder
                 (.getAlgorithm (.getPublicKey revk)) 
                 HashAlgorithmTags/SHA256)]
@@ -470,7 +483,9 @@
             skdb (new BcPBESecretKeyDecryptorBuilder 
                    (new BcPGPDigestCalculatorProvider)),
             ssv (gen-ssv date (.getKeyID revk), :revocation reason)]
-        (.init sg PGPSignature/KEY_REVOCATION
+        (.init sg (if (key-master? pubk) 
+                    PGPSignature/KEY_REVOCATION 
+                    PGPSignature/SUBKEY_REVOCATION)
           (.extractPrivateKey revk (.build skdb (char-array password))))
         (.setHashedSubpackets sg ssv)
         (let [sig (.generateCertification sg pubk),
@@ -555,9 +570,6 @@
   
   (keyring-get-public [keyring]
     keyring)
-
-  (keyring-get-public-key [keyring]
-    (.getPublicKey (:public keyring)))
   
   (keyring-put-public-key [keyring key]
     (->PublicKeyring (PGPPublicKeyRing/insertPublicKey 
@@ -572,12 +584,9 @@
 
   (keyring-get-public [keyring]
     (->PublicKeyring (keyring-public (:secret keyring))))
-
-  (keyring-get-public-key [keyring]
-    (.getPublicKey (:secret keyring)))
   
   (keyring-put-public-key [keyring key]
-    (let [sk (.getSecretKey (:secret keyring)),
+    (let [sk (.getSecretKey (:secret keyring) (.getKeyID key)),
           usk (PGPSecretKey/replacePublicKey sk key)]
       (->SecretKeyring (PGPSecretKeyRing/insertSecretKey 
                          (:secret keyring) usk))))
