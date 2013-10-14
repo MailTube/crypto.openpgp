@@ -279,14 +279,20 @@
     (new BcPGPKeyPair PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT 
       (gen-elg-kp random strength) date)))
 
-(defn- gen-ssv [date issuer & {:keys [expire flags mdc revocation revoker 
-                                      embedded prefs]}]
+(defn- gen-ssv [date issuer & {:keys [expire flags mdc revocation 
+                                      revoker embedded prefs notes
+                                      revocable local expirable]}]
   (let [cr true, ssg (new PGPSignatureSubpacketGenerator)]
-    (.setRevocable ssg cr false)
+    (when-not revocable
+      (.setRevocable ssg cr false))
+    (when local
+      (.setExportable ssg cr false))
+    (when expirable (when (> expirable 0)
+                      (.setSignatureExpirationTime ssg cr expirable)))
     (.setSignatureCreationTime ssg cr date)
     (.setIssuerKeyID ssg cr issuer)
     (when expire (when (> expire 0)
-      (.setKeyExpirationTime ssg cr expire)))
+                   (.setKeyExpirationTime ssg cr expire)))
     (when flags 
       (.setKeyFlags ssg cr 
         (case flags
@@ -306,11 +312,14 @@
         (int-array [SymmetricKeyAlgorithmTags/AES_256]))
       (.setPreferredHashAlgorithms ssg cr 
         (int-array [HashAlgorithmTags/SHA256])))
+    (when notes (dorun (map #(.setNotationData ssg cr true 
+                               (first %) (second %)) notes)))
     (.generate ssg)))
 
-(defn- gen-ssv-std [date issuer expire]
-  (gen-ssv date issuer, :expire expire, :mdc true, 
-    :flags :sign-certify, :prefs true))
+(defn- gen-ssv-std [date issuer expire notes revocable local expirable]
+  (gen-ssv date issuer, :mdc true, :prefs true, :flags :sign-certify, 
+    :expire expire, :notes notes, :revocable revocable, 
+    :local local, :expirable expirable))
 
 (defn- key-collide? [key1 key2]
   (= (.getKeyID key1) (.getKeyID key2)))
@@ -348,16 +357,19 @@
     (if keyid (.getPublicKey (keyring-get keyring) keyid)
       (keyring-get-public-key keyring))))
 
-; Generates a minimal keyring suitable for signing and encryption. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequential collection of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'master' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of master and encryption keypairs respectively, defaults are [:DSA 2048] for master and [:RSA-ENCRYPT 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private keys PBE protection will be performed with a 'cipher' algorithm, defaults to :AES-256; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration; 'level' is a keyword defining a type of a self-signed certification that will be included in the keyring, defaults to :POSITIVE-CERTIFICATION. The function returns a new keyring in the form of a SecretKeyring object.
-(defn gen-keyring [userid password & 
-                   {:keys [random date master encryption cipher expire level] 
+; Generates a minimal keyring suitable for signing and encryption. Parameters: 'userid' is a String identifying the keyring owner; 'password' is a sequential collection of Character's for a private keys PBE protection. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a keyring creation timestamp, defaults to the current time; both 'master' and 'encryption' parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of master and encryption keypairs respectively, defaults are [:DSA 2048] for master and [:RSA-ENCRYPT 2048] for encryption, 'encryption' may be nil for no encryption keypair generation; the private keys PBE protection will be performed with a 'cipher' algorithm, defaults to :AES-256; the keyring will become obsoleted in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration; 'level' is a keyword defining a type of a self-signed certification that will be included in the keyring, defaults to :POSITIVE-CERTIFICATION; 'notes' is a collection of notations to add to a certificate, each notation is a two-element collection of strings where the first element is a name of a notation and the second is its value; a certificate could not be revoked if 'revocable' is false, defaults to true; a certificate could not be exported if 'local' is true, defaults to false; a certificate will become obsoleted in 'expirable' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a new keyring in the form of a SecretKeyring object.
+(defn keyring-gen [userid password & 
+                   {:keys [random date master encryption cipher expire level
+                           notes revocable local expirable] 
                     :or {random (new java.security.SecureRandom),
                          date (new Date),
                          master [:DSA 2048],
                          encryption [:RSA-ENCRYPT 2048],
                          cipher :AES-256,
                          expire 0,
-                         level :POSITIVE-CERTIFICATION}}]
+                         level :POSITIVE-CERTIFICATION,
+                         notes [], 
+                         revocable true, local false, expirable 0}}]
   (check (sequential? password))
   (let [skp (gen-keypair (first master) random (second master) date),
         skeb (new BcPBESecretKeyEncryptorBuilder (skat-from-kw cipher) 
@@ -370,7 +382,8 @@
           csb (new BcPGPContentSignerBuilder 
                 (.getAlgorithm (.getPublicKey skp)) HashAlgorithmTags/SHA256)]
       (.setSecureRandom csb random)
-      (let [sss (gen-ssv-std date (.getKeyID skp) expire),
+      (let [sss (gen-ssv-std date (.getKeyID skp) expire 
+                  notes revocable local expirable),
             krg (new PGPKeyRingGenerator (csl-from-kw level)
                   skp userid dc sss nil csb ske)]
         (when encryption
@@ -383,13 +396,16 @@
                            (.generateSecretKeyRing krg) 
                            (.generatePublicKeyRing krg)))))))
 
-; Adds a new certification to a keyring. A certification binds keys of a keyring to a particular user identifier. A keyring generated by the 'gen-keyring' API already contains a self-signed certificate. Parameters: 'keyring' is a SecretKeyring or PublicKeyring object containing the keyring to be certified; 'userid' is a user String identifier that will be bound to the 'keyring' by the newly generated certificate; 'signer' is a SecretKeyring object that will be used as a certificate issuer (self-signing is allowed, i.e. 'keyring' and 'signer' could belong to the same keyring); 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'signer'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a certification creation timestamp, defaults to the current time; when self-signing, the certification will obsolete the keyring in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration; 'level' is a keyword defining a type of the certificate, defaults to :POSITIVE-CERTIFICATION. The function returns a 'keyring' clone with the certification added.
+; Adds a new certification to a keyring. A certification binds keys of a keyring to a particular user identifier. A keyring generated by the 'keyring-gen' API already contains a self-signed certificate. Parameters: 'keyring' is a SecretKeyring or PublicKeyring object containing the keyring to be certified; 'userid' is a user String identifier that will be bound to the 'keyring' by the newly generated certificate; 'signer' is a SecretKeyring object that will be used as a certificate issuer (self-signing is allowed, i.e. 'keyring' and 'signer' could belong to the same keyring); 'password' is a sequential collection of Character's for the purpose of private signing key extraction from the 'signer'. Optional named parameters: 'random' is an object of type java.security.SecureRandom, defaults to a new instance; 'date' is an object of type java.util.Date representing a certification creation timestamp, defaults to the current time; when self-signing, the certification will obsolete the keyring in 'expire' seconds after the 'date' timestamp, defaults to 0 which means no expiration; 'level' is a keyword defining a type of the certificate, defaults to :POSITIVE-CERTIFICATION when self-signing and :DEFAULT-CERTIFICATION otherwise; 'notes' is a collection of notations to add to the certificate, each notation is a two-element collection of strings where the first element is a name of a notation and the second is its value; the certificate could not be revoked if 'revocable' is false, defaults to true; the certificate could not be exported if 'local' is true, defaults to false; the certificate will become obsoleted in 'expirable' seconds after the 'date' timestamp, defaults to 0 which means no expiration. The function returns a 'keyring' clone with the certification added.
 (defn keyring-certify [keyring userid signer password &
-                       {:keys [random date expire level] 
+                       {:keys [random date expire level 
+                               notes revocable local expirable] 
                         :or {random (new java.security.SecureRandom),
                              date (new Date),
                              expire 0,
-                             level :POSITIVE-CERTIFICATION}}]
+                             level :auto,
+                             notes [], 
+                             revocable true, local false, expirable 0}}]
   (check (sequential? password))
   (let [pubk (keyring-get-public-key keyring),
         sigk (.getSecretKey (:secret signer)),
@@ -403,9 +419,15 @@
             skdb (new BcPBESecretKeyDecryptorBuilder 
                    (new BcPGPDigestCalculatorProvider)),
             ssv (if selfsigning 
-                  (gen-ssv-std date (.getKeyID sigk) expire) 
-                  (gen-ssv date (.getKeyID sigk)))]
-        (.init sg (csl-from-kw level)
+                  (gen-ssv-std date (.getKeyID sigk) expire 
+                    notes revocable local expirable) 
+                  (gen-ssv date (.getKeyID sigk),
+                    :notes notes, :revocable revocable, 
+                    :local local, :expirable expirable))]
+        (.init sg (csl-from-kw 
+                    (if (not= level :auto) level 
+                      (if selfsigning 
+                        :POSITIVE-CERTIFICATION :DEFAULT-CERTIFICATION)))
           (.extractPrivateKey sigk (.build skdb (char-array password))))
         (.setHashedSubpackets sg ssv)
         (let [sig (.generateCertification sg userid pubk),
