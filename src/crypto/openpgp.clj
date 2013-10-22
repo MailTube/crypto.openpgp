@@ -277,6 +277,8 @@ The function returns a `java.io.InputStream` object for the caller application t
 
 (defn- prime-certainty [] 80)
 
+(defn- prime-strength [] 3072)
+
 (defn- rrt-from-kw [kw]
   (case kw
     :KEY-COMPROMISED RevocationReasonTags/KEY_COMPROMISED,
@@ -426,7 +428,7 @@ Optional parameters:
 
 * __`random`__ is an object of type `java.security.SecureRandom`, defaults to a new instance;
 * __`date`__ is an object of type `java.util.Date` representing a keyring creation timestamp, defaults to the current time;
-* both __`master`__ and __`encryption`__ parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of master and encryption keypairs respectively, defaults are `[:DSA 2048]` for master and `[:RSA-ENCRYPT 2048]` for encryption, __`encryption`__ may be `nil` for no encryption keypair generation;
+* both __`master`__ and __`encryption`__ parameters are two-element collections each specifying the desired algorithm (the first element) and strength (the second element) of master and encryption keypairs respectively, defaults are `[:DSA 3072]` for master and `[:RSA-ENCRYPT 3072]` for encryption, __`encryption`__ may be `nil` for no encryption keypair generation;
 * the private keys PBE protection will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
 * the keyring will become obsoleted in __`expire`__ seconds after the __`date`__ timestamp, defaults to `0` which means no expiration;
 * __`level`__ is a keyword defining a type of a self-signed certification that will be included in the keyring, defaults to `:POSITIVE-CERTIFICATION`;
@@ -442,8 +444,8 @@ The function returns a new keyring in the form of a `SecretKeyring` object.
            notes revocable local expirable] 
     :or {random (new java.security.SecureRandom),
          date (new Date),
-         master [:DSA 2048],
-         encryption [:RSA-ENCRYPT 2048],
+         master [:DSA (prime-strength)],
+         encryption [:RSA-ENCRYPT (prime-strength)],
          cipher :AES-256,
          expire 0,
          level :POSITIVE-CERTIFICATION,
@@ -545,7 +547,7 @@ Optional parameters:
 
 * __`random`__ is an object of type `java.security.SecureRandom`, defaults to a new instance;
 * __`date`__ is an object of type `java.util.Date` representing a keypair creation timestamp, defaults to the current time;
-* __`spec`__ parameter is a two-element collection specifying the desired algorithm (the first element) and strength (the second element) of a keypair, defaults are `[:RSA-SIGN 2048]` for signing and `[:RSA-ENCRYPT 2048]` for encryption;
+* __`spec`__ parameter is a two-element collection specifying the desired algorithm (the first element) and strength (the second element) of a keypair, defaults are `[:RSA-SIGN 3072]` for signing and `[:RSA-ENCRYPT 3072]` for encryption;
 * __`subpassword`__ is a sequential collection of `Character`'s for the keypair private key PBE protection, defaults to __`password`__;
 * the keypair private key PBE protection will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
 * the keypair will become obsoleted in __`expire`__ seconds after the __`date`__ timestamp, defaults to `0` which means no expiration.
@@ -557,8 +559,8 @@ The function returns a __`keyring`__ clone with a newly generated keypair added.
     :or {random (new java.security.SecureRandom),
          date (new Date),
          spec (case usage 
-                :sign [:RSA-SIGN 2048],
-                :encrypt [:RSA-ENCRYPT 2048]),
+                :sign [:RSA-SIGN (prime-strength)],
+                :encrypt [:RSA-ENCRYPT (prime-strength)]),
          subpassword password, 
          cipher :AES-256,
          expire 0}}]
