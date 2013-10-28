@@ -651,6 +651,51 @@ The function returns a __`keyring`__ clone with the revocation added.
               cpubk (PGPPublicKey/addCertification pubk sig)]
           (keyring-put-public-key keyring cpubk))))))
 
+(defn keyring-revoke-signature "
+Adds a User ID certificate revocation or direct-key signature revocation to a keyring. A revoked certificate (or direct-key signature) should no longer be used as a valid User ID binding (or valid direct-key statement).
+
+Required parameters:
+
+* __`keyring`__ is a `SecretKeyring` or `PublicKeyring` object containing the User ID certificate or direct-key signature to be revoked;
+* __`userid`__ is a User ID `String` identifying the target certificate, may be `nil` to generate a direct-key signature revocation;
+* __`revoker`__ is a `SecretKeyring` object that will be used as a revocation issuer (authorized revoke is allowed, i.e. __`revoker`__ does not have to be an issuer of a self-signed target certificate);
+* __`password`__ is a sequential collection of `Character`'s for the purpose of private master signing key extraction from the __`revoker`__.
+
+Optional parameters:
+
+* __`random`__ is an object of type `java.security.SecureRandom`, defaults to a new instance;
+* __`date`__ is an object of type `java.util.Date` representing a revocation creation timestamp, defaults to the current time;
+* __`reason`__ is a keyword specifying the revocation reason tag to be included in the generated certificate, defaults to `nil` which means no tagging;
+
+The function returns a __`keyring`__ clone with the revocation added.
+" ; defn keyring-revoke-signature
+  [keyring userid revoker password &
+   {:keys [random date reason]
+    :or {random (new java.security.SecureRandom),
+         date (new Date), reason nil}}]
+  (check (sequential? password))
+  (let [pubk (keyring-get-public-key keyring),
+        revk (.getSecretKey (:secret revoker))]
+    (check (and (key-master? pubk revk) (key-signing? revk)))
+    (let [csb (new BcPGPContentSignerBuilder
+                (.getAlgorithm (.getPublicKey revk)) 
+                HashAlgorithmTags/SHA256)]
+      (.setSecureRandom csb random)
+      (let [sg (new PGPSignatureGenerator csb),
+            skdb (new BcPBESecretKeyDecryptorBuilder 
+                   (new BcPGPDigestCalculatorProvider)),
+            ssv (gen-ssv date (.getKeyID revk), :revocation reason)]
+        (.init sg PGPSignature/CERTIFICATION_REVOCATION 
+          (.extractPrivateKey revk (.build skdb (char-array password))))
+        (.setHashedSubpackets sg ssv)
+        (let [sig (if userid 
+                    (.generateCertification sg userid pubk) 
+                    (.generateCertification sg pubk)),
+              cpubk (if userid
+                      (PGPPublicKey/addCertification pubk userid sig)
+                      (PGPPublicKey/addCertification pubk sig))]
+          (keyring-put-public-key keyring cpubk))))))
+
 (defn keyring-add-revoker "
 Adds a revoker authorization to a keyring. An authorization is created by a keyring owner in order to allow a revoker to revoke a keyring without being its owner.
 
