@@ -11,7 +11,7 @@ Public functions with names beginning with '`keyring-`' return and accept `Publi
 " ; ns crypto.openpgp
   (:import
     [java.util Date]
-    [java.io FilterOutputStream FilterInputStream]
+    [java.io OutputStream FilterOutputStream FilterInputStream]
     [java.security SecureRandom]
     [org.apache.commons.math3.distribution BinomialDistribution]
     [org.apache.commons.math3.stat.inference ChiSquareTest]
@@ -34,7 +34,8 @@ Public functions with names beginning with '`keyring-`' return and accept `Publi
      BcPGPDataEncryptorBuilder BcPBEKeyEncryptionMethodGenerator
      BcPBEDataDecryptorFactory BcPGPDigestCalculatorProvider
      BcPGPKeyPair BcPBESecretKeyEncryptorBuilder BcPGPContentSignerBuilder
-     BcPBESecretKeyDecryptorBuilder BcKeyFingerprintCalculator]
+     BcPBESecretKeyDecryptorBuilder BcKeyFingerprintCalculator
+     BcPublicKeyKeyEncryptionMethodGenerator]
     [org.bouncycastle.bcpg 
      CompressionAlgorithmTags SymmetricKeyAlgorithmTags
      ArmoredOutputStream PublicKeyAlgorithmTags HashAlgorithmTags
@@ -266,6 +267,67 @@ The function returns a `java.io.InputStream` object for the caller application t
 
 ;-------------------------------------------------------------------------------
 
+(defn- key-collide? [key1 key2]
+  (= (.getKeyID key1) (.getKeyID key2)))
+
+(defn- key-pair? [public secret]
+  (and (instance? PGPPublicKey public) (instance? PGPSecretKey secret)
+    (key-collide? public secret)))
+
+(defn- key-signing? [key]
+  (and (instance? PGPSecretKey key) (.isSigningKey key)))
+
+(defn- key-encryption? [key]
+  (and (instance? PGPPublicKey key) (.isEncryptionKey key)))
+
+(defn- key-master? [& keys]
+  (empty? (filter false? (map #(.isMasterKey %) keys))))
+
+(defn- key-get-public [key]
+  (if (instance? PGPPublicKey key) key (.getPublicKey key)))
+
+(defn- key-get-signatures [key & types]
+  (let [tset (set types),
+        sigs (iterator-seq (.getSignatures (key-get-public key)))]
+    (sort-by #(.getCreationTime %) 
+      (filter #(contains? tset (.getSignatureType %)) sigs))))
+        
+(defn- key-revoked? [key]
+  (.isRevoked (key-get-public key)))
+
+(defn- key-expired? [key date]
+  (let [pk (key-get-public key),
+        ex (.getValidSeconds pk)]
+    (if (<= ex 0) false
+      (let [cr (.getCreationTime pk)] 
+        (> (.getTime date) (+ (.getTime cr) (* 1000 ex)))))))
+
+(defn- key-has-flag [key flag]
+  (let [pk (key-get-public key),
+        keyid (.getKeyID pk),
+        sigs (if (key-master? pk) 
+               (filter #(= keyid (.getKeyID %)) 
+                 (reverse (key-get-signatures pk 
+                            PGPSignature/POSITIVE_CERTIFICATION 
+                            PGPSignature/CASUAL_CERTIFICATION 
+                            PGPSignature/DEFAULT_CERTIFICATION)))
+               (reverse (key-get-signatures pk PGPSignature/SUBKEY_BINDING))),
+        sig (first sigs)]
+    (if (not sig) false
+      (let [hsp (.getHashedSubPackets sig),
+            flags (if hsp (.getKeyFlags hsp) 0)]
+        (== (bit-and flags flag) flag)))))
+
+(defn- key-can-encrypt [key date]
+  (and (key-encryption? key) (not (key-revoked? key))
+    (not (key-expired? key date)) (key-has-flag key KeyFlags/ENCRYPT_COMMS)))
+
+(defn- key-can-sign [key date]
+  (and (key-signing? key) (not (key-revoked? key))
+    (not (key-expired? key date)) (key-has-flag key KeyFlags/SIGN_DATA)))
+
+;-------------------------------------------------------------------------------
+
 (defrecord ^:private PublicKeyring [public])
 
 (defrecord ^:private SecretKeyring [secret])
@@ -379,22 +441,6 @@ The function returns a `java.io.InputStream` object for the caller application t
   (gen-ssv date issuer, :mdc true, :prefs true, :flags :sign-certify, 
     :expire expire, :notes notes, :revocable revocable, 
     :local local, :expirable expirable))
-
-(defn- key-collide? [key1 key2]
-  (= (.getKeyID key1) (.getKeyID key2)))
-
-(defn- key-pair? [public secret]
-  (and (instance? PGPPublicKey public) (instance? PGPSecretKey secret)
-    (key-collide? public secret)))
-
-(defn- key-signing? [key]
-  (and (instance? PGPSecretKey key) (.isSigningKey key)))
-
-(defn- key-encryption? [key]
-  (and (instance? PGPPublicKey key) (.isEncryptionKey key)))
-
-(defn- key-master? [& keys]
-  (empty? (filter false? (map #(.isMasterKey %) keys))))
 
 (defn- keyring-public [secret]
   (let [stub (new PGPPublicKey ; PGPPublicKeyRing(List) is not accessible.
@@ -839,6 +885,139 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
                          (:secret keyring) usk))))
     
   )
+
+;-------------------------------------------------------------------------------
+
+(defn- kr-find-encryption-key [keyring date]
+  (check (not (keyring-revoked? keyring)))
+  (let [all (iterator-seq (.getPublicKeys (keyring-get keyring))),
+        key (first (filter #(key-can-encrypt % date) (reverse all)))]
+    key))
+
+(defn- kr-find-signing-key [keyring date]
+  (check (not (keyring-revoked? keyring)))
+  (let [all (iterator-seq (.getSecretKeys (keyring-get keyring))),
+        key (first (filter #(key-can-sign % date) (reverse all)))]
+    key))
+
+(defn- write-encrypted [output password keyrings 
+                        partial cipher integrity random date]
+  (check (or (not password) (sequential? password)))
+  (let [deb (new BcPGPDataEncryptorBuilder (skat-from-kw cipher))]
+    (.setSecureRandom deb random)
+    (.setWithIntegrityPacket deb integrity)
+    (let [edg (new PGPEncryptedDataGenerator deb),
+          buffer (byte-array partial)]
+      (when password
+        (let [kemg (new BcPBEKeyEncryptionMethodGenerator 
+                     (char-array password) 
+                     (.get (new BcPGPDigestCalculatorProvider) 
+                       HashAlgorithmTags/SHA256))]
+          (.setSecureRandom kemg random)
+          (.addMethod edg kemg)))
+      (let [apkm (fn [keyring] 
+                   (let [kemg (new BcPublicKeyKeyEncryptionMethodGenerator 
+                                (kr-find-encryption-key keyring date))] 
+                     (.setSecureRandom kemg random)
+                     (.addMethod edg kemg)))]
+        (dorun (map apkm keyrings)))
+      (chained-close (.open edg output buffer) output))))
+
+(defn- kr-signature-generator [key password random]
+  (check (sequential? password))
+  (let [csb (new BcPGPContentSignerBuilder 
+              (.getAlgorithm (.getPublicKey key)) HashAlgorithmTags/SHA256)]
+    (.setSecureRandom csb random)
+    (let [sg (new PGPSignatureGenerator csb),
+          skdb (new BcPBESecretKeyDecryptorBuilder 
+                 (new BcPGPDigestCalculatorProvider))]
+      (.init sg PGPSignature/BINARY_DOCUMENT 
+        (.extractPrivateKey key (.build skdb (char-array password))))
+      sg)))
+
+(defn- kr-signature-updater [generators]
+  (proxy [OutputStream] []
+    (write
+      ([b] 
+        (let [val (if (= (class b) java.lang.Integer) (.byteValue b) b)]
+          (dorun (map #(.update % val) generators))))
+      ([b off len]
+        (dorun (map #(.update % b off len) generators))))))
+
+(defn- kr-signature-maker [generators chained]
+  (proxy [FilterOutputStream ChainedClose] [chained]
+    (close [] 
+      (dorun (map #(.encode (.generate %) chained) generators))
+      (when (instance? ChainedClose chained)
+        (.close chained)))))
+
+(defn- write-signed [output signers random date]
+  (let [sgs (map (fn [[signer password]] 
+                   (kr-signature-generator 
+                     (kr-find-signing-key signer date) password random)) 
+                   signers),
+        end (dec (count sgs))]
+    (dorun (map #(.encode (.generateOnePassVersion %1 (< %2 end)) output) 
+             sgs (range)))
+    [(kr-signature-maker sgs output) (kr-signature-updater sgs)]))
+
+(defn- write-tee [stream1 stream2]
+  (proxy [OutputStream ChainedClose] []
+    (write
+      ([b] 
+        (.write stream1 b)
+        (.write stream2 b))
+      ([b off len]
+        (.write stream1 b off len)
+        (.write stream2 b off len)))
+    (flush []
+      (.flush stream1)
+      (.flush stream2))
+    (close []
+      (.close stream1)
+      (.close stream2))))
+
+(defn encryptor "
+Creates a general case encryptor. Required parameter __`output`__ is a `java.io.OutputStream` object that will receive ciphertext. The actual encryption will be done if one or both of either __`password`__ or __`keyrings`__ optional parameters are specified.
+
+Optional parameters:
+
+* plaintext will be signed by __`signers`__ which is a collection of two-element collections where the first element is a `SecretKeyring` object and the second is a sequential collection of `Character`'s serving as a password for the purpose of suitable private signing key extraction from the first element object;
+* if __`compress`__ is `false` then no compression of plaintext will be done before possible encryption, default is to compress data;
+* __`password`__ is a sequential collection of `Character`'s adding a password based encryption method, defaults to `nil` which skips password based encryption;
+* __`keyrings`__ is a collection of `SecretKeyring` or `PublicKeyring` objects each adding a new public key based encryption method;
+* __`enarmor`__ specifies whether to produce armored textual ciphertext, defaults to `false`;
+* __`partial`__ specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to `1048576` (1Mb);
+* symmetric part of the encryption will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
+* if __`integrity`__ is `false` then integrity packet that protects data from modification will not be written, default is to write this packet;
+* __`random`__ is an object of type `java.security.SecureRandom`, defaults to a new instance;
+* __`date`__ is an object of type `java.util.Date` representing a timestamp to use for expiry checking of signing and encryption keys, defaults to the current time.
+
+The function returns a `java.io.OutputStream` object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close __`output`__.
+" ; defn encryptor
+  [output &
+   {:keys [signers compress password keyrings enarmor 
+           partial cipher integrity random date] 
+    :or {signers [],
+         compress true,
+         password nil,
+         keyrings [],
+         enarmor false,
+         partial (default-partial),
+         cipher :AES-256,
+         integrity true,
+         random (new java.security.SecureRandom),
+         date (new java.util.Date)}}]
+  (let [arm (if enarmor (write-armored output) output), 
+        enc (if (or password (not-empty keyrings)) 
+              (write-encrypted arm password keyrings 
+                partial cipher integrity random date) arm),
+        com (if compress (write-compressed enc, :partial partial) enc),
+        [sig upd] (if (not-empty signers) 
+              (write-signed com signers random date) [com nil]),
+        lit (write-literal sig, :partial partial),
+        tee (if (not-empty signers) (write-tee lit upd) lit)]
+    tee))
 
 ;-------------------------------------------------------------------------------
 
