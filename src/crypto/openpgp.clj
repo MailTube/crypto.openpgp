@@ -867,7 +867,7 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
         (dorun (map apkm keyrings)))
       (chained-close (.open edg output buffer) output))))
 
-(defn- kr-signature-generator [key password random]
+(defn- kr-signature-generator [key password random date]
   (check (sequential? password))
   (let [csb (new BcPGPContentSignerBuilder 
               (.getAlgorithm (.getPublicKey key)) HashAlgorithmTags/SHA256)]
@@ -877,6 +877,8 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
                  (new BcPGPDigestCalculatorProvider))]
       (.init sg PGPSignature/BINARY_DOCUMENT 
         (.extractPrivateKey key (.build skdb (char-array password))))
+      (.setHashedSubpackets sg 
+        (gen-ssv date (.getKeyID key), :revocable :irrelevant))
       sg)))
 
 (defn- kr-signature-updater [generators]
@@ -898,11 +900,11 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
 (defn- write-signed [output signers random date]
   (let [sgs (map (fn [[signer password]] 
                    (kr-signature-generator 
-                     (kr-find-signing-key signer date) password random)) 
+                     (kr-find-signing-key signer date) password random date)) 
                    signers),
         end (dec (count sgs))]
     (dorun (map #(.encode (.generateOnePassVersion %1 (< %2 end)) output) 
-             sgs (range)))
+             (reverse sgs) (range)))
     [(kr-signature-maker sgs output) (kr-signature-updater sgs)]))
 
 (defn- write-literal [output partial]
@@ -942,7 +944,7 @@ Optional parameters:
 * symmetric part of the encryption will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
 * if __`integrity`__ is `false` then integrity packet that protects data from modification will not be written, default is to write this packet;
 * __`random`__ is an object of type `java.security.SecureRandom`, defaults to a new instance;
-* __`date`__ is an object of type `java.util.Date` representing a timestamp to use for expiry checking of signing and encryption keys, defaults to the current time.
+* __`date`__ is an object of type `java.util.Date` representing a signatures creation timestamp, will also be used for expiry checking of signing and encryption keys, defaults to the current time.
 
 The function returns a `java.io.OutputStream` object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close __`output`__.
 " ; defn encryptor
@@ -982,22 +984,23 @@ Optional parameters:
 
 * if __`compress`__ is `false` then no compression of plaintext will be done before encryption, default is to compress data;
 * __`enarmor`__ specifies whether to produce armored textual ciphertext, defaults to `false`;
-* __`partial`__ specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to `1048576` (1Mb).
+* __`partial`__ specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to `1048576` (1Mb);
 * encryption will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
 * if __`integrity`__ is `false` then integrity packet that protects data from modification will not be written, default is to write this packet;
+* __`random`__ is an object of type `java.security.SecureRandom`, defaults to a new instance.
 
 The function returns a `java.io.OutputStream` object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close __`output`__.
 " ; defn encryptor-pbe
   [output password &
-   {:keys [compress enarmor partial cipher integrity] 
+   {:keys [compress enarmor partial cipher integrity random] 
     :or {compress true,
          enarmor false,
          partial (default-partial),
          cipher :AES-256,
-         integrity true}}]
-  (encryptor output, 
-    :compress compress, :password password, :enarmor enarmor, 
-    :partial partial, :cipher cipher, :integrity integrity))
+         integrity true,
+         random (new java.security.SecureRandom)}}]
+  (encryptor output, :compress compress, :password password, :enarmor enarmor, 
+    :partial partial, :cipher cipher, :integrity integrity, :random random))
 
 ;-------------------------------------------------------------------------------
 
