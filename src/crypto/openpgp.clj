@@ -132,17 +132,6 @@ Optional parameters:
 
 ;-------------------------------------------------------------------------------
 
-(defn- default-partial [] 1048576)
-
-(definterface ^:private ChainedClose)
-
-(defn- chained-close [stream chained]
-  (proxy [FilterOutputStream ChainedClose] [stream]
-    (close [] 
-      (.close stream) 
-      (when (instance? ChainedClose chained)
-        (.close chained)))))
-
 (defn- skat-from-kw [kw]
   (case kw
     :TRIPLE-DES SymmetricKeyAlgorithmTags/TRIPLE_DES,
@@ -153,71 +142,6 @@ Optional parameters:
     :AES-256 SymmetricKeyAlgorithmTags/AES_256,
     :TWOFISH SymmetricKeyAlgorithmTags/TWOFISH,
     nil SymmetricKeyAlgorithmTags/NULL))
-
-(defn- write-armored [os]
-  (let [aos (new ArmoredOutputStream os)]
-    (chained-close aos os)))
-
-(defn- write-pbe-encrypted [os pw & 
-                           {:keys [partial cipher integrity]
-                            :or {partial (default-partial),
-                                 cipher :AES-256,
-                                 integrity true}}]
-  (check (sequential? pw))
-  (let [deb (new BcPGPDataEncryptorBuilder (skat-from-kw cipher))]
-    (.setWithIntegrityPacket deb integrity)
-    (let [edg (new PGPEncryptedDataGenerator deb),
-          emg (new BcPBEKeyEncryptionMethodGenerator (char-array pw)),
-          buffer (byte-array partial)]
-      (.addMethod edg emg)
-      (chained-close (.open edg os buffer) os))))
-
-(defn- write-compressed [os &
-                        {:keys [partial]
-                         :or {partial (default-partial)}}]
-  (let [cdg (new PGPCompressedDataGenerator CompressionAlgorithmTags/ZIP),
-        buffer (byte-array partial)]
-    (chained-close (.open cdg os buffer) os)))
-
-(defn- write-literal [os &
-                     {:keys [partial]
-                      :or {partial (default-partial)}}]
-  (let [ldg (new PGPLiteralDataGenerator),
-        date (new Date 0),
-        buffer (byte-array partial)]
-    (chained-close (.open ldg os PGPLiteralData/BINARY "" date buffer) os)))
-
-(defn pbe-encryptor "
-Creates a password based encryptor.
-
-Required parameters:
-
-* __`output`__ is a `java.io.OutputStream` object that will receive ciphertext;
-* __`password`__ is a sequential collection of `Character`'s.
-
-Optional parameters:
-
-* __`enarmor`__ specifies whether to produce armored textual ciphertext, defaults to `false`;
-* if __`compress`__ is `false` then no compression of plaintext will be done before encryption, default is to compress data;
-* encryption will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
-* if __`integrity`__ is `false` then integrity packet that protects data from modification will not be written, default is to write this packet;
-* __`partial`__ specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to `1048576` (1Mb).
-
-The function returns a `java.io.OutputStream` object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close __`output`__.
-" ; defn pbe-encryptor
-  [output password &
-   {:keys [enarmor compress] 
-    :or {enarmor false,
-         compress true} 
-    :as conf}]
-  (let [forward (flatten (seq conf)),
-        arm (if enarmor (write-armored output) output), 
-        enc (apply (partial write-pbe-encrypted arm password) forward),
-        com (if compress (apply (partial write-compressed enc) forward) enc),
-        lit (apply (partial write-literal com) forward)]
-    lit))
-
-;-------------------------------------------------------------------------------
 
 (defn- dearmor [is]
   (PGPUtil/getDecoderStream is))
@@ -247,7 +171,7 @@ The function returns a `java.io.OutputStream` object for the caller application 
     (check ld)
     (.getInputStream ld)))
 
-(defn pbe-decryptor "
+(defn decryptor-pbe "
 Creates a password based decryptor.
 
 Required parameters:
@@ -256,7 +180,7 @@ Required parameters:
 * __`password`__ is a sequential collection of `Character`'s.
 
 The function returns a `java.io.InputStream` object for the caller application to read plaintext from. Closing the returned stream possibly drains all unread data, performs an integrity check and does not close __`input`__.
-" ; defn pbe-decryptor
+" ; defn decryptor-pbe
   [input password]
   (let [[of ed] (parse-pbe-encrypted
                   (object-factory (dearmor input)) password),
@@ -888,17 +812,37 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
 
 ;-------------------------------------------------------------------------------
 
+(defn- default-partial [] 1048576)
+
+(definterface ^:private ChainedClose)
+
+(defn- chained-close [stream chained]
+  (proxy [FilterOutputStream ChainedClose] [stream]
+    (close [] 
+      (.close stream) 
+      (when (instance? ChainedClose chained)
+        (.close chained)))))
+
 (defn- kr-find-encryption-key [keyring date]
-  (check (not (keyring-revoked? keyring)))
-  (let [all (iterator-seq (.getPublicKeys (keyring-get keyring))),
-        key (first (filter #(key-can-encrypt % date) (reverse all)))]
-    key))
+  (if (keyring-revoked? keyring) nil
+    (let [all (iterator-seq (.getPublicKeys (keyring-get keyring))),
+          key (first (filter #(key-can-encrypt % date) (reverse all)))]
+      key)))
 
 (defn- kr-find-signing-key [keyring date]
-  (check (not (keyring-revoked? keyring)))
-  (let [all (iterator-seq (.getSecretKeys (keyring-get keyring))),
-        key (first (filter #(key-can-sign % date) (reverse all)))]
-    key))
+  (if (keyring-revoked? keyring) nil
+    (let [all (iterator-seq (.getSecretKeys (keyring-get keyring))),
+          key (first (filter #(key-can-sign % date) (reverse all)))]
+      key)))
+
+(defn- write-armored [output]
+  (let [aos (new ArmoredOutputStream output)]
+    (chained-close aos output)))
+
+(defn- write-compressed [output partial]
+  (let [cdg (new PGPCompressedDataGenerator CompressionAlgorithmTags/ZIP),
+        buffer (byte-array partial)]
+    (chained-close (.open cdg output buffer) output)))
 
 (defn- write-encrypted [output password keyrings 
                         partial cipher integrity random date]
@@ -961,6 +905,13 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
              sgs (range)))
     [(kr-signature-maker sgs output) (kr-signature-updater sgs)]))
 
+(defn- write-literal [output partial]
+  (let [ldg (new PGPLiteralDataGenerator),
+        date (new java.util.Date 0),
+        buffer (byte-array partial)]
+    (chained-close 
+      (.open ldg output PGPLiteralData/BINARY "" date buffer) output)))
+
 (defn- write-tee [stream1 stream2]
   (proxy [OutputStream ChainedClose] []
     (write
@@ -1012,12 +963,41 @@ The function returns a `java.io.OutputStream` object for the caller application 
         enc (if (or password (not-empty keyrings)) 
               (write-encrypted arm password keyrings 
                 partial cipher integrity random date) arm),
-        com (if compress (write-compressed enc, :partial partial) enc),
+        com (if compress (write-compressed enc partial) enc),
         [sig upd] (if (not-empty signers) 
               (write-signed com signers random date) [com nil]),
-        lit (write-literal sig, :partial partial),
+        lit (write-literal sig partial),
         tee (if (not-empty signers) (write-tee lit upd) lit)]
     tee))
+
+(defn encryptor-pbe "
+Creates a password based encryptor.
+
+Required parameters:
+
+* __`output`__ is a `java.io.OutputStream` object that will receive ciphertext;
+* __`password`__ is a sequential collection of `Character`'s.
+
+Optional parameters:
+
+* if __`compress`__ is `false` then no compression of plaintext will be done before encryption, default is to compress data;
+* __`enarmor`__ specifies whether to produce armored textual ciphertext, defaults to `false`;
+* __`partial`__ specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to `1048576` (1Mb).
+* encryption will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
+* if __`integrity`__ is `false` then integrity packet that protects data from modification will not be written, default is to write this packet;
+
+The function returns a `java.io.OutputStream` object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close __`output`__.
+" ; defn encryptor-pbe
+  [output password &
+   {:keys [compress enarmor partial cipher integrity] 
+    :or {compress true,
+         enarmor false,
+         partial (default-partial),
+         cipher :AES-256,
+         integrity true}}]
+  (encryptor output, 
+    :compress compress, :password password, :enarmor enarmor, 
+    :partial partial, :cipher cipher, :integrity integrity))
 
 ;-------------------------------------------------------------------------------
 

@@ -46,19 +46,19 @@
 
 (defn- pbe-encryptor-test [string password]
   (let [os (new ByteArrayOutputStream),
-        es (pbe-encryptor os password, :enarmor true),
+        es (encryptor-pbe os password, :enarmor true),
         ew (new OutputStreamWriter es "UTF-8")]
     (spit ew string)
     (.toByteArray os)))
 
 (defn- pbe-decryptor-test [buffer password]
   (let [is (new ByteArrayInputStream buffer),
-        ds (pbe-decryptor is password),
+        ds (decryptor-pbe is password),
         dr (new InputStreamReader ds "UTF-8")]
     (slurp dr)))
 
 (deftest c-test
-  (testing "pbe-encryptor/pbe-decryptor"
+  (testing "encryptor-pbe/decryptor-pbe"
     (let [buffer (pbe-encryptor-test (test-string) (test-password)),
           string (pbe-decryptor-test buffer (test-password))]
       (is (= string (test-string))))))
