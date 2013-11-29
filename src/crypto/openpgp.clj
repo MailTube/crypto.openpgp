@@ -11,7 +11,7 @@ Public functions with names beginning with '`keyring-`' return and accept `Publi
 " ; ns crypto.openpgp
   (:import
     [java.util Date]
-    [java.io OutputStream FilterOutputStream FilterInputStream]
+    [java.io OutputStream FilterOutputStream InputStream FilterInputStream]
     [java.security SecureRandom]
     [org.apache.commons.math3.distribution BinomialDistribution]
     [org.apache.commons.math3.stat.inference ChiSquareTest]
@@ -29,13 +29,15 @@ Public functions with names beginning with '`keyring-`' return and accept `Publi
      PGPPBEEncryptedData PGPObjectFactory PGPMarker PGPUtil
      PGPEncryptedDataList PGPKeyRingGenerator PGPSignature 
      PGPSignatureSubpacketGenerator PGPSignatureGenerator
-     PGPSecretKey PGPSecretKeyRing PGPPublicKey PGPPublicKeyRing]
+     PGPSecretKey PGPSecretKeyRing PGPPublicKey PGPPublicKeyRing
+     PGPPublicKeyEncryptedData PGPOnePassSignatureList PGPSignatureList]
     [org.bouncycastle.openpgp.operator.bc 
      BcPGPDataEncryptorBuilder BcPBEKeyEncryptionMethodGenerator
      BcPBEDataDecryptorFactory BcPGPDigestCalculatorProvider
      BcPGPKeyPair BcPBESecretKeyEncryptorBuilder BcPGPContentSignerBuilder
      BcPBESecretKeyDecryptorBuilder BcKeyFingerprintCalculator
-     BcPublicKeyKeyEncryptionMethodGenerator]
+     BcPublicKeyKeyEncryptionMethodGenerator BcPublicKeyDataDecryptorFactory
+     BcPGPContentVerifierBuilderProvider]
     [org.bouncycastle.bcpg 
      CompressionAlgorithmTags SymmetricKeyAlgorithmTags
      ArmoredOutputStream PublicKeyAlgorithmTags HashAlgorithmTags
@@ -59,6 +61,13 @@ An always-on analogue of the `assert` macro.
   ([x message]
     `(when-not ~x
        (throw (new AssertionError (str "Check failed: " ~message "\n" (pr-str '~x)))))))
+
+(defn- raise [map]
+  (throw (ex-info nil map)))
+
+(defn- raise-if-not [map cond]
+  (when-not cond
+    (raise map)))
 
 ;-------------------------------------------------------------------------------
 
@@ -780,6 +789,15 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
   [keyring]
   (.isRevoked (keyring-get-public-key keyring)))
 
+(defn- keyrings-filter-by-userids "
+" ; defn keyrings-filter-by-userids
+  [keyrings userids]
+  (let [ff (fn [kr]
+             (let [uids (iterator-seq (.getUserIDs
+                                        (keyring-get-public-key kr)))]
+               (some #(contains? userids %) uids)))]
+    (filter ff keyrings)))
+
 (extend-protocol Keyring PublicKeyring
 
   (keyring-get [keyring]
@@ -1001,6 +1019,165 @@ The function returns a `java.io.OutputStream` object for the caller application 
          random (new java.security.SecureRandom)}}]
   (encryptor output, :compress compress, :password password, :enarmor enarmor, 
     :partial partial, :cipher cipher, :integrity integrity, :random random))
+
+;-------------------------------------------------------------------------------
+
+(defn- parse-encrypted [factory pbe-method key-method]
+  (if (not (instance? PGPEncryptedDataList (first factory)))
+    [factory :unencrypted]
+    (let [edo (iterator-seq (.getEncryptedDataObjects (first factory))),
+          pbe (first (filter #(instance? PGPPBEEncryptedData %) edo)),
+          password (if pbe (pbe-method) nil)]
+      (when password 
+        (raise-if-not {:type ::pbe-method} (sequential? password)))
+      (if password 
+        (let [ddf (new BcPBEDataDecryptorFactory (char-array password) 
+                    (new BcPGPDigestCalculatorProvider))]
+          [(object-factory (.getDataStream pbe ddf)) pbe])
+        (let [keys (filter #(instance? PGPPublicKeyEncryptedData %) edo),
+              ids (set (map #(.getKeyID %) keys)),
+              [id kr pw] (key-method ids)]
+          (raise-if-not {:type ::keyid} (== (count ids) (count keys)))
+          (raise-if-not {:type ::key-method} (and (contains? ids id)
+                                               (instance? SecretKeyring kr)
+                                               (sequential? pw)))
+          (let [key (first (filter #(= id (.getKeyID %)) keys)),
+                sk (.getSecretKey (keyring-get kr) id),
+                pk (.extractPrivateKey sk 
+                     (.build (new BcPBESecretKeyDecryptorBuilder 
+                               (new BcPGPDigestCalculatorProvider)) 
+                       (char-array pw))),
+                ddf (new BcPublicKeyDataDecryptorFactory pk)]
+            [(object-factory (.getDataStream key ddf)) key]))))))
+
+(defn- parse-signed [factory verifiers]
+  (if (not (instance? PGPOnePassSignatureList (first factory)))
+    [factory :unsigned]
+    (let [opsl (first factory),
+          opss (map #(.get opsl %) (range (.size opsl))),
+          ids (set (map #(.getKeyID %) opss))]
+      (raise-if-not {:type ::keyid} (== (count ids) (count opss)))
+      (let [vs (verifiers ids),
+            vopss (filter #(contains? vs (.getKeyID %)) opss)]
+        (raise-if-not {:type ::verifiers} (== (count vs) (count vopss)))
+        (dorun (map #(let [id (.getKeyID %),
+                           key (.getPublicKey (keyring-get (get vs id)) id)]
+                       (.init % (new BcPGPContentVerifierBuilderProvider) 
+                         key)) vopss))
+        [(rest factory) vopss]))))
+
+(defn- parse-eofs [f3 f2 f1 required]
+  (check f3)
+  (let [fff (filter identity [f3 f2 f1]),
+        ff (if (contains? required :eof) fff (drop-last fff))]
+    (dorun (map #(let [object (first %)]
+                   (raise-if-not {:type ::tail} (not object))) ff))))
+
+(defn- kr-signature-mdc-verifier [stream edo f3 f2 f1 required]
+  (proxy [FilterInputStream] [stream]
+    (close []
+      (when-not (= edo :unencrypted)
+        (raise-if-not {:type ::integrity} (.verify edo)))
+      (parse-eofs f3 f2 f1 required))))
+
+(defn- kr-verify-signatures [object opss]
+  (let [sl (cast PGPSignatureList object),
+        ss (map #(.get sl %) (range (.size sl))),
+        idss (reduce #(assoc %1 (.getKeyID %2) %2) {} ss)]
+    (raise-if-not {:type ::keyid} (== (count ss) (count idss)))
+    (let [failed (set (filter identity
+                        (map #(let [id (.getKeyID %),
+                                    sig (get idss id)]
+                                (raise-if-not {:type ::keyid} sig)
+                                (if (.verify % sig) nil id))
+                          opss)))]
+      (when-not (empty? failed)
+        (raise {:type ::verification, :failed-signatures failed})))))
+
+(defn- kr-signature-sig-verifier [stream edo f3 f2 f1 required opss]
+  (proxy [InputStream] []
+    (read 
+      ([] 
+        (let [b (.read stream)]
+          (when-not (== b -1)
+            (let [val (.byteValue b)]
+              (dorun (map #(.update % val) opss))))
+          b))
+      ([b] 
+        (let [num (.read stream b)]
+          (when (> num 0)
+            (dorun (map #(.update % b 0 num) opss)))
+          num))
+      ([b off len]
+        (let [num (.read stream b off len)]
+          (when (> num 0)
+            (dorun (map #(.update % b off num) opss)))
+          num)))
+    (close []
+      (kr-verify-signatures (first f3) opss)
+      (when-not (= edo :unencrypted)
+        (when (.isIntegrityProtected edo)
+          (raise-if-not {:type ::integrity} (.verify edo))))
+      (parse-eofs (rest f3) f2 f1 required))))
+
+(defn decryptor "
+Creates a general case decryptor. Required parameter __`input`__ is a `java.io.InputStream` object that will be used as a source of ciphertext. The actual decryption will be done if one or both of either __`pbe-method`__ or __`key-method`__ optional parameters are specified.
+
+Optional parameters:
+
+* __`pbe-method`__ is a function of no arguments, it will be called if ciphertext was encrypted using a PBE method; the function must return either `nil` or a sequential collection of `Character`'s; when not `nil` the returned value will be used as a password for decryption;
+* __`key-method`__ is a function of one argument, it will be called if ciphertext was encrypted using a public key method and password based decryption is not in effect; the argument is a set of 64-bit integer Key ID's of keys that could decrypt ciphertext; the function must return a three-element collection where the first element is a 64-bit integer Key ID selected from the passed in set, the second element is a `SecretKeyring` object containing a decrypting key (which will be used for ciphertext decryption) with the same Key ID as in the first element, and the third element is a sequential collection of `Character`'s serving as a password for the purpose of private decrypting key extraction from the second element object; 
+* __`verifiers`__ is a function of one argument, it will be called if ciphertext contains signed plaintext; the argument is a set of 64-bit integer Key ID's of keys that could verify plaintext signatures; the function must return a possibly empty index-value map where every index is a 64-bit integer Key ID selected from the passed in set and every corresponding value is a `PublicKeyring` or `SecretKeyring` object containing a verifying key (which will be used for a signatures verification process) with the same Key ID as in the index;
+* __`required`__ is a set of keywords possibly containing `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, `:signed` keyword which forces the decryptor to throw an exception if input data was not signed, `:verification` keyword which forces the decryptor to throw an exception if input data was signed but the __`verifiers`__ function returns an empty map, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects.
+
+The function returns a `java.io.InputStream` object for the caller application to read plaintext from. The returned stream should be closed if and only if all available plaintext data was read from it successfully. Closing the returned stream does not close __`input`__ and throws an exception if either signatures verification or integrity checking fails.
+" ; defn decryptor
+  [input &
+   {:keys [pbe-method key-method verifiers required]
+    :or {pbe-method (fn [] nil),
+         key-method (fn [ids] nil),
+         verifiers (fn [ids] nil),
+         required #{}}}]
+  (let [enc (object-factory (dearmor input)),
+        [com edo] (parse-encrypted enc pbe-method key-method)]
+    (when (= edo :unencrypted)
+      (raise-if-not {:type ::unencrypted}
+        (not (contains? required :encrypted))))
+    (let [sig (parse-compressed com),
+          [lit opss] (parse-signed sig verifiers)]
+      (if (= opss :unsigned)
+        (raise-if-not {:type ::unsigned} (not (contains? required :signed)))
+        (when (empty? opss)
+          (raise-if-not {:type ::verifiers} 
+            (not (contains? required :verification)))))
+      (let [stream (parse-literal lit),
+            f3 (rest lit),
+            f2 (if (= com sig) nil (rest com)),
+            f1 (if (= enc com) nil (rest enc))]
+        (if (= opss :unsigned)
+          (kr-signature-mdc-verifier stream edo f3 f2 f1 required)
+          (kr-signature-sig-verifier stream edo f3 f2 f1 required opss))))))
+
+(defn- kr-some-keyid [keyring keyids]
+  (let [keys (iterator-seq (.getPublicKeys (keyring-get keyring)))]
+    (some #(when (contains? keyids %) %) (map #(.getKeyID %) keys))))
+
+(defn- kr-group-some-by-keyids [keyrings keyids]
+  (reduce #(let [keyid (kr-some-keyid %2 keyids)]
+             (if keyid (assoc %1 keyid %2) %1)) {} keyrings))
+
+(defn- make-key-method-selector "
+" ; defn make-key-method-selector
+  [keyrings password]
+  (fn [keyids]
+    (let [[id kr] (first (kr-group-some-by-keyids keyrings keyids))]
+      [id kr password])))
+
+(defn- make-verifiers-selector "
+" ; defn make-verifiers-selector
+  [keyrings]
+  (fn [keyids]
+    (kr-group-some-by-keyids keyrings keyids)))
 
 ;-------------------------------------------------------------------------------
 
