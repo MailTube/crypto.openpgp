@@ -789,13 +789,19 @@ Tests whether a keyring contains a revocation of its master keypair. Required pa
   [keyring]
   (.isRevoked (keyring-get-public-key keyring)))
 
-(defn- keyrings-filter-by-userids "
+(defn keyrings-filter-by-userids "
+Filters passed in keyrings and returns a new keyring collection where each keyring contains at least one User ID that matches a specified pattern.
+
+Required parameters:
+
+* __`keyrings`__ is a collection of `SecretKeyring` or `PublicKeyring` objects;
+* __`userids`__ is a pattern that will be used to match User ID's during filtering.
 " ; defn keyrings-filter-by-userids
   [keyrings userids]
   (let [ff (fn [kr]
              (let [uids (iterator-seq (.getUserIDs
                                         (keyring-get-public-key kr)))]
-               (some #(contains? userids %) uids)))]
+               (some #(re-matches userids %) uids)))]
     (filter ff keyrings)))
 
 (extend-protocol Keyring PublicKeyring
@@ -1166,14 +1172,27 @@ The function returns a `java.io.InputStream` object for the caller application t
   (reduce #(let [keyid (kr-some-keyid %2 keyids)]
              (if keyid (assoc %1 keyid %2) %1)) {} keyrings))
 
-(defn- make-key-method-selector "
+(defn make-key-method-selector "
+A helper function that may be used to create a `key-method` parameter for the `decryptor` API. The returned function will use a specified keyring collection in order to find a suitable decrypting keyring.
+
+Required parameters:
+
+* __`keyrings`__ is a collection of `SecretKeyring` objects for the returned function to find a decrypting keyring in;
+* __`password`__ is a sequential collection of `Character`'s for the returned function to return as a third element in a three-element collection.
+
+The function returns a function that will return a properly initialized three-element collection as required by the `decryptor` API.
 " ; defn make-key-method-selector
   [keyrings password]
   (fn [keyids]
     (let [[id kr] (first (kr-group-some-by-keyids keyrings keyids))]
       [id kr password])))
 
-(defn- make-verifiers-selector "
+(defn make-verifiers-selector "
+A helper function that may be used to create a `verifiers` parameter for the `decryptor` API. The returned function will use a specified keyring collection in order to find suitable verifying keyrings.
+
+Required parameter __`keyrings`__ is a collection of `SecretKeyring` or `PublicKeyring` objects for the returned function to find verifying keyrings in.
+
+The function returns a function that will return a properly initialized index-value map as required by the `decryptor` API.
 " ; defn make-verifiers-selector
   [keyrings]
   (fn [keyids]
