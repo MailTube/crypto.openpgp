@@ -152,54 +152,6 @@ Optional parameters:
     :TWOFISH SymmetricKeyAlgorithmTags/TWOFISH,
     nil SymmetricKeyAlgorithmTags/NULL))
 
-(defn- dearmor [is]
-  (PGPUtil/getDecoderStream is))
-
-(defn- object-factory [is]
-  (let [of (new PGPObjectFactory is)]
-    (filter #(not (instance? PGPMarker %)) (repeatedly #(.nextObject of)))))
-
-(defn- parse-pbe-encrypted [of pw]
-  (check (sequential? pw))
-  (let [edl (cast PGPEncryptedDataList (first of)),
-        ed (first (filter 
-                    (partial instance? PGPPBEEncryptedData) 
-                    (iterator-seq (.getEncryptedDataObjects edl))))]
-    (check ed)
-    (let [ddf (new BcPBEDataDecryptorFactory (char-array pw) 
-                (new BcPGPDigestCalculatorProvider))]
-      [(object-factory (.getDataStream ed ddf)) ed])))
-
-(defn- parse-compressed [of]
-  (let [ld (first of)]
-    (if (not (instance? PGPCompressedData ld))
-      of (object-factory (.getDataStream ld)))))
-
-(defn- parse-literal [of]
-  (let [ld (first (filter #(instance? PGPLiteralData %) of))]
-    (check ld)
-    (.getInputStream ld)))
-
-(defn decryptor-pbe "
-Creates a password based decryptor.
-
-Required parameters:
-
-* __`input`__ is a `java.io.InputStream` object that will be used as a source of ciphertext;
-* __`password`__ is a sequential collection of `Character`'s.
-
-The function returns a `java.io.InputStream` object for the caller application to read plaintext from. Closing the returned stream possibly drains all unread data, performs an integrity check and does not close __`input`__.
-" ; defn decryptor-pbe
-  [input password]
-  (let [[of ed] (parse-pbe-encrypted
-                  (object-factory (dearmor input)) password),
-        stream (parse-literal (parse-compressed of))]
-    (proxy [FilterInputStream] [stream]
-      (close []
-        (check (.verify ed))))))
-
-;-------------------------------------------------------------------------------
-
 (defn- key-collide? [key1 key2]
   (= (.getKeyID key1) (.getKeyID key2)))
 
@@ -1028,6 +980,14 @@ The function returns a `java.io.OutputStream` object for the caller application 
 
 ;-------------------------------------------------------------------------------
 
+(defn- dearmor [input]
+  (PGPUtil/getDecoderStream input))
+
+(defn- object-factory [input]
+  (let [factory (new PGPObjectFactory input)]
+    (filter #(not (instance? PGPMarker %)) 
+      (repeatedly #(.nextObject factory)))))
+
 (defn- parse-encrypted [factory pbe-method key-method]
   (if (not (instance? PGPEncryptedDataList (first factory)))
     [factory :unencrypted]
@@ -1056,6 +1016,11 @@ The function returns a `java.io.OutputStream` object for the caller application 
                 ddf (new BcPublicKeyDataDecryptorFactory pk)]
             [(object-factory (.getDataStream key ddf)) key]))))))
 
+(defn- parse-compressed [factory]
+  (let [object (first factory)]
+    (if (not (instance? PGPCompressedData object))
+      factory (object-factory (.getDataStream object)))))
+
 (defn- parse-signed [factory verifiers]
   (if (not (instance? PGPOnePassSignatureList (first factory)))
     [factory :unsigned]
@@ -1071,6 +1036,10 @@ The function returns a `java.io.OutputStream` object for the caller application 
                        (.init % (new BcPGPContentVerifierBuilderProvider) 
                          key)) vopss))
         [(rest factory) vopss]))))
+
+(defn- parse-literal [factory]
+  (let [object (cast PGPLiteralData (first factory))]
+    (.getInputStream object)))
 
 (defn- parse-eofs [f3 f2 f1 required]
   (check f3)
@@ -1197,6 +1166,25 @@ The function returns a function that will return a properly initialized index-va
   [keyrings]
   (fn [keyids]
     (kr-group-some-by-keyids keyrings keyids)))
+
+(defn decryptor-pbe "
+Creates a password based decryptor.
+
+Required parameters:
+
+* __`input`__ is a `java.io.InputStream` object that will be used as a source of ciphertext;
+* __`password`__ is a sequential collection of `Character`'s for the purpose of data decrypting.
+
+An optional parameter __`required`__ is a set of keywords possibly containing `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects.
+
+The function returns a `java.io.InputStream` object for the caller application to read plaintext from. The returned stream should be closed if and only if all available plaintext data was read from it successfully. Closing the returned stream does not close __`input`__ and throws an exception if integrity checking fails.
+" ; defn decryptor-pbe
+  [input password &
+   {:keys [required]
+    :or {required #{}}}]
+  (check (empty? (disj required :encrypted :eof))) 
+  (decryptor input, :pbe-method (fn [] password), 
+    :required (conj required :verification)))
 
 ;-------------------------------------------------------------------------------
 
