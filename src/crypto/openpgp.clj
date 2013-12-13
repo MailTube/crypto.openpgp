@@ -18,10 +18,12 @@ Public functions with names beginning with '`keyring-`' return and accept `Publi
     [org.apache.commons.math3.util FastMath]
     [org.bouncycastle.crypto.params 
      RSAKeyGenerationParameters DSAKeyGenerationParameters 
-     ElGamalKeyGenerationParameters DSAParameterGenerationParameters]
+     ElGamalKeyGenerationParameters DSAParameterGenerationParameters
+     ECDomainParameters ECKeyGenerationParameters]
     [org.bouncycastle.crypto.generators
      RSAKeyPairGenerator DSAParametersGenerator DSAKeyPairGenerator
-     ElGamalParametersGenerator ElGamalKeyPairGenerator]
+     ElGamalParametersGenerator ElGamalKeyPairGenerator
+     ECKeyPairGenerator]
     [org.bouncycastle.crypto.digests SHA256Digest]
     [org.bouncycastle.openpgp
      PGPLiteralDataGenerator PGPCompressedDataGenerator PGPKeyPair
@@ -43,7 +45,8 @@ Public functions with names beginning with '`keyring-`' return and accept `Publi
      ArmoredOutputStream PublicKeyAlgorithmTags HashAlgorithmTags
      RSAPublicBCPGKey PublicKeyPacket]
     [org.bouncycastle.bcpg.sig 
-     KeyFlags Features RevocationReasonTags]))
+     KeyFlags Features RevocationReasonTags]
+    [org.bouncycastle.asn1.x9 ECNamedCurveTable X9ECParameters]))
 
 ;-------------------------------------------------------------------------------
 
@@ -270,6 +273,15 @@ Optional parameters:
       (.init kpg kgp) 
       (.generateKeyPair kpg))))
 
+(defn- gen-ec-kp [random strength]
+  (let [curve (ECNamedCurveTable/getByName (name strength))
+        dp (new ECDomainParameters (.getCurve curve) (.getG curve)
+             (.getN curve) (.getH curve) (.getSeed curve)),
+        kgp (new ECKeyGenerationParameters dp random),
+        kpg (new ECKeyPairGenerator)]
+    (.init kpg kgp) 
+    (.generateKeyPair kpg)))
+
 (defn- gen-keypair [algorithm random strength date]
   (case algorithm 
     :DSA 
@@ -283,7 +295,13 @@ Optional parameters:
       (gen-rsa-kp random strength) date),
     :ELGAMAL-ENCRYPT
     (new BcPGPKeyPair PublicKeyAlgorithmTags/ELGAMAL_ENCRYPT 
-      (gen-elg-kp random strength) date)))
+      (gen-elg-kp random strength) date)
+    :ECDSA
+    (new BcPGPKeyPair PublicKeyAlgorithmTags/ECDSA 
+      (gen-ec-kp random strength) date)
+    :ECDH
+    (new BcPGPKeyPair PublicKeyAlgorithmTags/ECDH 
+      (gen-ec-kp random strength) date)))
 
 (defn- gen-ssv [date issuer & {:keys [expire flags mdc revocation 
                                       revoker embedded prefs notes

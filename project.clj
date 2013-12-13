@@ -4,7 +4,7 @@
   :license {:name "Public Domain (Unlicense)"
             :url "http://unlicense.org"}
   :dependencies [[org.clojure/clojure "1.5.1"]
-                 [org.bouncycastle/bcpg-jdk15on "1.49"]
+                 [org.bouncycastle/bcpg-jdk15on "1.50"]
                  [org.apache.commons/commons-math3 "3.2"]]
   :profiles {:codox {:plugins [[codox "0.6.6"]]
                      :dependencies [[codox-md "0.2.0"]]
