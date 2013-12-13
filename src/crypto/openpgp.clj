@@ -978,6 +978,40 @@ The function returns a `java.io.OutputStream` object for the caller application 
   (encryptor output, :compress compress, :password password, :enarmor enarmor, 
     :partial partial, :cipher cipher, :integrity integrity, :random random))
 
+(defn encryptor-key "
+Creates a key based encryptor.
+
+Required parameters:
+
+* __`output`__ is a `java.io.OutputStream` object that will receive ciphertext;
+* plaintext will be signed by __`signers`__ which is a collection of two-element collections where the first element is a `SecretKeyring` object and the second is a sequential collection of `Character`'s serving as a password for the purpose of suitable private signing key extraction from the first element object;
+* __`keyrings`__ is a collection of `SecretKeyring` or `PublicKeyring` objects each adding a new public key based encryption method.
+
+Optional parameters:
+
+* if __`compress`__ is `false` then no compression of plaintext will be done before possible encryption, default is to compress data;
+* __`enarmor`__ specifies whether to produce armored textual ciphertext, defaults to `false`;
+* __`partial`__ specifies the size in bytes of partial data packets to use during plaintext processing, compression and encryption phases, defaults to `1048576` (1Mb);
+* symmetric part of the encryption will be performed with a __`cipher`__ algorithm, defaults to `:AES-256`;
+* if __`integrity`__ is `false` then integrity packet that protects data from modification will not be written, default is to write this packet;
+* __`random`__ is an object of type `java.security.SecureRandom`, defaults to a new instance;
+* __`date`__ is an object of type `java.util.Date` representing a signatures creation timestamp, will also be used for expiry checking of signing and encryption keys, defaults to the current time.
+
+The function returns a `java.io.OutputStream` object for the caller application to write plaintext into. The returned stream must be closed if and only if all desired plaintext data was written into it successfully. Closing the returned stream does not close __`output`__.
+" ; defn encryptor-key
+  [output signers keyrings &
+   {:keys [compress enarmor partial cipher integrity random date] 
+    :or {compress true,
+         enarmor false,
+         partial (default-partial),
+         cipher :AES-256,
+         integrity true,
+         random (new java.security.SecureRandom),
+         date (new java.util.Date)}}]
+  (encryptor output, :signers signers, :keyrings keyrings, 
+    :compress compress, :enarmor enarmor, :partial partial, 
+    :cipher cipher, :integrity integrity, :random random, :date date))
+
 ;-------------------------------------------------------------------------------
 
 (defn- dearmor [input]
@@ -1185,6 +1219,27 @@ The function returns a `java.io.InputStream` object for the caller application t
   (check (empty? (disj required :encrypted :eof))) 
   (decryptor input, :pbe-method (fn [] password), 
     :required (conj required :verification)))
+
+(defn decryptor-key "
+Creates a key based decryptor.
+
+Required parameters:
+
+* __`input`__ is a `java.io.InputStream` object that will be used as a source of ciphertext;
+* __`keyrings`__ is a collection of `SecretKeyring` objects containing at least one keyring with a decrypting key suitable for ciphertext decryption;
+* __`password`__ is a sequential collection of `Character`'s serving as a password for the purpose of private decrypting key extraction from the ciphertext decrypting keyring found in the __`keyrings`__ collection;
+* __`verifiers`__ is a collection of `PublicKeyring` or `SecretKeyring` objects containing at least one keyring with a verifying key suitable for verification of one of plaintext signatures.
+
+An optional parameter __`required`__ is a set of keywords possibly containing `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, `:signed` keyword which forces the decryptor to throw an exception if input data was not signed, `:verification` keyword which forces the decryptor to throw an exception if input data was signed but a suitable verifying keyring was not found in the __`verifiers`__ collection, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects.
+
+The function returns a `java.io.InputStream` object for the caller application to read plaintext from. The returned stream should be closed if and only if all available plaintext data was read from it successfully. Closing the returned stream does not close __`input`__ and throws an exception if either signatures verification or integrity checking fails.
+" ; defn decryptor-key
+  [input keyrings password verifiers &
+   {:keys [required]
+    :or {required #{}}}]
+  (decryptor input, 
+    :key-method (make-key-method-selector keyrings password), 
+    :verifiers (make-verifiers-selector verifiers), :required required))
 
 ;-------------------------------------------------------------------------------
 

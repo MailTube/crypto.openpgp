@@ -64,3 +64,35 @@
       (is (= string (test-string))))))
 
 ;-------------------------------------------------------------------------------
+
+(defn- key-encryptor-test [string sender password recipient]
+  (let [os (new ByteArrayOutputStream),
+        es (encryptor-key os [[sender password]] [recipient], :enarmor true),
+        ew (new OutputStreamWriter es "UTF-8")]
+    (spit ew string)
+    (.toByteArray os)))
+
+(defn- key-decryptor-test [buffer recipient password sender]
+  (let [is (new ByteArrayInputStream buffer),
+        ds (decryptor-key is [recipient] password [sender],
+             :required #{:encrypted :signed :verification :eof}),
+        dr (new InputStreamReader ds "UTF-8")]
+    (slurp dr)))
+
+(deftest d-test
+  (testing "encryptor-key/decryptor-key"
+    (let [sender-pw [\s \e \n \d \e \r],
+          sender (keyring-gen "s@s.s" sender-pw, 
+                   :master [:RSA-SIGN 1024], 
+                   :encryption [:RSA-ENCRYPT 1024]),
+          recipient-pw [\r \e \c \i \p \i \e \n \t],
+          recipient (keyring-gen "r@r.r" recipient-pw, 
+                      :master [:RSA-SIGN 1024], 
+                      :encryption [:RSA-ENCRYPT 1024]),
+          buffer (key-encryptor-test (test-string) 
+                   sender sender-pw recipient),
+          string (key-decryptor-test buffer 
+                   recipient recipient-pw sender)]
+      (is (= string (test-string))))))
+
+;-------------------------------------------------------------------------------
