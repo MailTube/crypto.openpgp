@@ -1032,7 +1032,10 @@ The function returns a `java.io.OutputStream` object for the caller application 
 
 ;-------------------------------------------------------------------------------
 
-(defn- dearmor [input]
+(defn dearmor "
+Takes a `java.io.InputStream` of optionally armored OpenPGP objects and returns a new binary `java.io.InputStream` which wraps the passed in stream and decodes it if necessary.
+" ; defn dearmor
+  [input]
   (PGPUtil/getDecoderStream input))
 
 (defn- object-factory [input]
@@ -1155,7 +1158,7 @@ Optional parameters:
 * __`pbe-method`__ is a function of no arguments, it will be called if ciphertext was encrypted using a PBE method; the function must return either `nil` or a sequential collection of `Character`'s; when not `nil` the returned value will be used as a password for decryption;
 * __`key-method`__ is a function of one argument, it will be called if ciphertext was encrypted using a public key method and password based decryption is not in effect; the argument is a set of 64-bit integer Key ID's of keys that could decrypt ciphertext; the function must return a three-element collection where the first element is a 64-bit integer Key ID selected from the passed in set, the second element is a `SecretKeyring` object containing a decrypting key (which will be used for ciphertext decryption) with the same Key ID as in the first element, and the third element is a sequential collection of `Character`'s serving as a password for the purpose of private decrypting key extraction from the second element object; 
 * __`verifiers`__ is a function of one argument, it will be called if ciphertext contains signed plaintext; the argument is a set of 64-bit integer Key ID's of keys that could verify plaintext signatures; the function must return a possibly empty index-value map where every index is a 64-bit integer Key ID selected from the passed in set and every corresponding value is a `PublicKeyring` or `SecretKeyring` object containing a verifying key (which will be used for a signatures verification process) with the same Key ID as in the index;
-* __`required`__ is a set of keywords possibly containing `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, `:signed` keyword which forces the decryptor to throw an exception if input data was not signed, `:verification` keyword which forces the decryptor to throw an exception if input data was signed but the __`verifiers`__ function returns an empty map, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects.
+* __`required`__ is a set of keywords possibly containing `:binary` keyword which makes the decryptor to accept only binary input, `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, `:signed` keyword which forces the decryptor to throw an exception if input data was not signed, `:verification` keyword which forces the decryptor to throw an exception if input data was signed but the __`verifiers`__ function returns an empty map, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects or other trailing data.
 
 The function returns a `java.io.InputStream` object for the caller application to read plaintext from. The returned stream should be closed if and only if all available plaintext data was read from it successfully. Closing the returned stream does not close __`input`__ and throws an exception if either signatures verification or integrity checking fails.
 " ; defn decryptor
@@ -1165,7 +1168,8 @@ The function returns a `java.io.InputStream` object for the caller application t
          key-method (fn [ids] nil),
          verifiers (fn [ids] nil),
          required #{}}}]
-  (let [enc (object-factory (dearmor input)),
+  (let [enc (object-factory 
+              (if (contains? required :binary) input (dearmor input))),
         [com edo] (parse-encrypted enc pbe-method key-method)]
     (when (= edo :unencrypted)
       (raise-if-not {:type ::unencrypted}
@@ -1227,14 +1231,14 @@ Required parameters:
 * __`input`__ is a `java.io.InputStream` object that will be used as a source of ciphertext;
 * __`password`__ is a sequential collection of `Character`'s for the purpose of data decrypting.
 
-An optional parameter __`required`__ is a set of keywords possibly containing `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects.
+An optional parameter __`required`__ is a set of keywords possibly containing `:binary` keyword which makes the decryptor to accept only binary input, `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects or other trailing data.
 
 The function returns a `java.io.InputStream` object for the caller application to read plaintext from. The returned stream should be closed if and only if all available plaintext data was read from it successfully. Closing the returned stream does not close __`input`__ and throws an exception if integrity checking fails.
 " ; defn decryptor-pbe
   [input password &
    {:keys [required]
     :or {required #{}}}]
-  (check (empty? (disj required :encrypted :eof))) 
+  (check (empty? (disj required :binary :encrypted :eof))) 
   (decryptor input, :pbe-method (fn [] password), 
     :required (conj required :verification)))
 
@@ -1248,7 +1252,7 @@ Required parameters:
 * __`password`__ is a sequential collection of `Character`'s serving as a password for the purpose of private decrypting key extraction from the ciphertext decrypting keyring found in the __`keyrings`__ collection;
 * __`verifiers`__ is a collection of `PublicKeyring` or `SecretKeyring` objects containing at least one keyring with a verifying key suitable for verification of one of plaintext signatures.
 
-An optional parameter __`required`__ is a set of keywords possibly containing `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, `:signed` keyword which forces the decryptor to throw an exception if input data was not signed, `:verification` keyword which forces the decryptor to throw an exception if input data was signed but a suitable verifying keyring was not found in the __`verifiers`__ collection, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects.
+An optional parameter __`required`__ is a set of keywords possibly containing `:binary` keyword which makes the decryptor to accept only binary input, `:encrypted` keyword which forces the decryptor to throw an exception if input data was not encrypted, `:signed` keyword which forces the decryptor to throw an exception if input data was not signed, `:verification` keyword which forces the decryptor to throw an exception if input data was signed but a suitable verifying keyring was not found in the __`verifiers`__ collection, and `:eof` keyword which makes closing the returned stream to throw an exception if the __`input`__ stream has trailing OpenPGP objects or other trailing data.
 
 The function returns a `java.io.InputStream` object for the caller application to read plaintext from. The returned stream should be closed if and only if all available plaintext data was read from it successfully. Closing the returned stream does not close __`input`__ and throws an exception if either signatures verification or integrity checking fails.
 " ; defn decryptor-key
